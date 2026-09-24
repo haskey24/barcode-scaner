@@ -136,6 +136,7 @@ class CheckInSystem:
 		self.item_category = tk.StringVar(value="")
 		self.borrower_name = tk.StringVar()
 		self.search_value = tk.StringVar()
+		self.tips_and_rules_text = None
 		self.multi_scan_enabled = tk.BooleanVar(value=False)
 		self.multi_scan_queue: list[str] = []
 		self.audit_mode = tk.BooleanVar(value=False)
@@ -253,6 +254,23 @@ class CheckInSystem:
 			"SELECT value FROM settings WHERE key = 'bell_schedule_file'"
 		).fetchone()
 		return (setting["value"] if setting else "").strip()
+
+	def get_setting(self, key: str, default: str = "") -> str:
+		"""Return a persisted app setting, or a default if it is missing."""
+		setting = self.database.execute(
+			"SELECT value FROM settings WHERE key = ?",
+			(key,),
+		).fetchone()
+		return setting["value"] if setting else default
+
+	def set_setting(self, key: str, value: str) -> None:
+		"""Persist a text value in the app settings table."""
+		self.database.execute(
+			"INSERT INTO settings (key, value) VALUES (?, ?) "
+			"ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+			(key, value),
+		)
+		self.database.commit()
 
 	def set_bell_schedule_file(self, file_path: str) -> None:
 		self.database.execute(
@@ -2032,17 +2050,25 @@ class CheckInSystem:
 			self.audit_frame.grid_remove()
 	def update_admin_controls(self) -> None:
 		"""Refresh everything that depends on admin_mode: background color, and which buttons are shown/enabled."""
-		self.apply_admin_background(self.admin_mode)
-		self.admin_status.set("Admin mode" if self.admin_mode else "Normal mode")
-		self.admin_button.configure(text="Leave Admin Mode" if self.admin_mode else "Enter Admin Mode")
+		if hasattr(self, "default_bg"):
+			self.apply_admin_background(self.admin_mode)
+		if hasattr(self, "admin_status"):
+			self.admin_status.set("Admin mode" if self.admin_mode else "Normal mode")
+		if hasattr(self, "admin_button"):
+			self.admin_button.configure(text="Leave Admin Mode" if self.admin_mode else "Enter Admin Mode")
+		if hasattr(self, "tips_and_rules_text"):
+			self.tips_and_rules_text.configure(state="normal" if self.admin_mode else "disabled")
 
-		# Admin-only controls are hidden entirely in normal mode, not just disabled.
-		admin_only_buttons = (
-			self.add_button, self.edit_button, self.photo_button,
-			self.unavailable_button, self.delete_button, self.history_button,
-			self.category_button, self.export_button, self.manage_accounts_button,
-			self.bell_schedule_button,
-		)
+		admin_only_buttons = []
+		for attr_name in (
+			"add_button", "edit_button", "photo_button",
+			"unavailable_button", "delete_button", "history_button",
+			"category_button", "export_button", "manage_accounts_button",
+			"bell_schedule_button",
+		):
+			button = getattr(self, attr_name, None)
+			if button is not None:
+				admin_only_buttons.append(button)
 		for button in admin_only_buttons:
 			if self.admin_mode:
 				button.grid()
@@ -2050,20 +2076,26 @@ class CheckInSystem:
 				button.grid_remove()
 
 		if self.admin_mode:
-			self.add_button.state(["!disabled"])
-			self.edit_button.state(["!disabled"] if self.selected_barcode else ["disabled"])
-			self.photo_button.state(["!disabled"] if self.selected_barcode else ["disabled"])
-			self.unavailable_button.state(["!disabled"] if self.selected_barcode else ["disabled"])
-			self.delete_button.state(["!disabled"] if self.selected_barcode else ["disabled"])
-			self.history_button.state(["!disabled"])
-			self.category_button.state(["!disabled"])
-			self.export_button.state(["!disabled"])
-			self.manage_accounts_button.state(["!disabled"])
-			self.bell_schedule_button.state(["!disabled"])
-		self.checkout_button.configure(state="normal" if self.selected_barcode else "disabled")
-		self.checkin_button.configure(state="normal" if self.selected_barcode else "disabled")
-		self.book_button.state(["!disabled"] if self.selected_barcode else ["disabled"])
-		if self.selected_barcode:
+			for attr_name in (
+				"add_button", "edit_button", "photo_button",
+				"unavailable_button", "delete_button", "history_button",
+				"category_button", "export_button", "manage_accounts_button",
+				"bell_schedule_button",
+			):
+				button = getattr(self, attr_name, None)
+				if button is not None:
+					button.state(["!disabled"])
+			for attr_name in ("edit_button", "photo_button", "unavailable_button", "delete_button"):
+				button = getattr(self, attr_name, None)
+				if button is not None:
+					button.state(["!disabled"] if self.selected_barcode else ["disabled"])
+		if hasattr(self, "checkout_button"):
+			self.checkout_button.configure(state="normal" if self.selected_barcode else "disabled")
+		if hasattr(self, "checkin_button"):
+			self.checkin_button.configure(state="normal" if self.selected_barcode else "disabled")
+		if hasattr(self, "book_button"):
+			self.book_button.state(["!disabled"] if self.selected_barcode else ["disabled"])
+		if self.selected_barcode and hasattr(self, "unavailable_button"):
 			row = self.database.execute(
 				"SELECT unavailable FROM items WHERE barcode = ?", (self.selected_barcode,)
 			).fetchone()
@@ -2660,11 +2692,21 @@ class CheckInSystem:
 		self.photo_button = ttk.Button(details, text="Add / Change Photo", command=self.choose_photo, state="disabled")
 		self.photo_button.grid(row=5, column=2, padx=(24, 0), pady=(8, 0))
 
+		tips_frame = ttk.LabelFrame(self.root, text="Tips and Rules", padding=10)
+		tips_frame.grid(row=3, column=0, padx=20, pady=(0, 8), sticky="ew")
+		tips_frame.columnconfigure(0, weight=1)
+		self.tips_and_rules_text = tk.Text(tips_frame, height=20, wrap="word", undo=True)
+		self.tips_and_rules_text.grid(row=0, column=0, sticky="ew")
+		self.tips_and_rules_text.insert("1.0", self.get_setting("tips_and_rules", ""))
+		self.tips_and_rules_text.bind("<<Modified>>", self.save_tips_and_rules_text)
+		self.tips_and_rules_text.edit_modified(False)
+		self.tips_and_rules_text.configure(state="disabled")
+
 		list_frame = ttk.LabelFrame(self.root, text="All items", padding=10)
-		list_frame.grid(row=3, column=0, padx=20, pady=(0, 20), sticky="nsew")
+		list_frame.grid(row=4, column=0, padx=20, pady=(0, 20), sticky="nsew")
 		list_frame.columnconfigure(0, weight=1)
 		list_frame.rowconfigure(1, weight=1)
-		self.root.rowconfigure(3, weight=1)
+		self.root.rowconfigure(4, weight=1)
 		search = ttk.Entry(list_frame, textvariable=self.search_value)
 		search.grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 8))
 		search.insert(0, "Search barcode or item name")
@@ -2704,6 +2746,16 @@ class CheckInSystem:
 		scrollbar.grid(row=1, column=2, sticky="ns")
 		self.items_table.configure(yscrollcommand=scrollbar.set)
 		self.items_table.bind("<<TreeviewSelect>>", self.select_table_item)
+
+	def save_tips_and_rules_text(self, event: object | None = None) -> None:
+		"""Persist the admin-entered tips and rules text so it remains visible and saved."""
+		if self.tips_and_rules_text is None or not self.admin_mode:
+			if self.tips_and_rules_text is not None:
+				self.tips_and_rules_text.edit_modified(False)
+			return
+		text = self.tips_and_rules_text.get("1.0", tk.END).rstrip("\n")
+		self.set_setting("tips_and_rules", text)
+		self.tips_and_rules_text.edit_modified(False)
 
 	def refresh_items(self) -> None:
 		"""Reload the item list, hiding unavailable items outside admin mode.
