@@ -1,0 +1,24 @@
+# Secrets and local data
+google-service-account.json
+check_in_system.db
+database_backups/
+
+# Python local files
+.venv/
+__pycache__/
+*.py[cod]
+
+# Build and packaged output
+build/
+dist/
+dmg_contents/
+/
+*.dmg
+*.app/
+
+# macOS metadata
+.DS_Store
+._*
+
+# IDE settings
+.vscode/
