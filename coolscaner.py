@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 import calendar
 import hashlib
 from pathlib import Path
+import re
 import secrets
 import shutil
 import subprocess
@@ -27,6 +28,8 @@ import sys
 import threading
 import time
 import sqlite3
+import zipfile
+from xml.etree import ElementTree
 from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -90,6 +93,8 @@ GOOGLE_SYNC_INTERVAL_MS = 10_000
 # check-in/out, covering one export cycle plus network latency.
 LOCAL_CHANGE_GRACE_SECONDS = (GOOGLE_SYNC_INTERVAL_MS / 1000) * 2
 BOOKING_REQUEST_DELETE_GRACE_SECONDS = 5 * 60
+# Notification sending is intentionally disabled until an email/SMS provider is configured.
+CHECKOUT_EXPIRY_NOTIFICATIONS_ENABLED = False
 # USB scanners in keyboard mode normally send a barcode much faster than a
 # person can type.  These values let us distinguish a scanner burst from
 # ordinary typing in another field.
@@ -138,6 +143,7 @@ class CheckInSystem:
 		self.audit_total_expected: int = 0
 		self.audit_categories: set[str] | None = None
 		self.audit_category_label = tk.StringVar(value="All categories")
+		self.expiration_check_running = False
 		self.google_worksheets = {}
 		self.last_export_values = None
 		self.last_history_export_values = None
@@ -145,6 +151,9 @@ class CheckInSystem:
 		self.google_executor = ThreadPoolExecutor(max_workers=1)
 		self.google_sync_running = False
 		self.google_import_running = False
+		self.bell_schedule_import_running = False
+		self.bell_schedule_refresh_callback = None
+		self.bell_schedule_refresh_callback = None
 		self.booking_requests_setup_done = False
 		self.last_booking_item_options = None
 		# Barcode -> monotonic time of the last local status change, so the sheet
@@ -158,6 +167,7 @@ class CheckInSystem:
 		self.root.protocol("WM_DELETE_WINDOW", self.close)
 		self.root.after(1_000, self.poll_google_sheet)
 		self.root.after(1_500, self.sync_to_google_sheets)
+		self.root.after(30_000, self.expire_due_checkouts)
 		# Allow scanner bursts to be recognized from any field.  Entry widgets get
 		# a first-in-line binding so their existing text can be restored after a
 		# confirmed scan instead of retaining the barcode characters.
@@ -237,6 +247,384 @@ class CheckInSystem:
 		self.google_worksheets[worksheet_name] = worksheet
 		return worksheet
 
+	def get_bell_schedule_file(self) -> str:
+		"""Return the locally downloaded bell schedule file path, if configured."""
+		setting = self.database.execute(
+			"SELECT value FROM settings WHERE key = 'bell_schedule_file'"
+		).fetchone()
+		return (setting["value"] if setting else "").strip()
+
+	def set_bell_schedule_file(self, file_path: str) -> None:
+		self.database.execute(
+			"INSERT INTO settings (key, value) VALUES ('bell_schedule_file', ?) "
+			"ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+			(file_path.strip(),),
+		)
+		self.database.commit()
+
+	def _read_downloaded_bell_schedule(self, file_path: str) -> dict:
+		"""Convert a downloaded .docx or text schedule into parser-compatible document text."""
+		path = Path(file_path)
+		if path.suffix.casefold() in {".txt", ".csv"}:
+			return {"body": {"content": [{"paragraph": {"elements": [{"textRun": {"content": path.read_text(encoding="utf-8-sig")}}]}}]}}
+		if path.suffix.casefold() == ".pdf":
+			from importlib import import_module
+			reader = import_module("pypdf").PdfReader(str(path))
+			text = self._normalize_pdf_schedule_text(
+				"\n".join(page.extract_text() or "" for page in reader.pages)
+			)
+			return {"body": {"content": [{"paragraph": {"elements": [{"textRun": {"content": text}}]}}]}}
+		if path.suffix.casefold() != ".docx":
+			raise ValueError("Choose a downloaded PDF, Word document (.docx), or text file (.txt/.csv).")
+		with zipfile.ZipFile(path) as archive:
+			document_xml = archive.read("word/document.xml")
+		root = ElementTree.fromstring(document_xml)
+		namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+		lines: list[str] = []
+		for child in root.find(f"{namespace}body") or []:
+			if child.tag == f"{namespace}tbl":
+				rows = child.findall(f"{namespace}tr")
+				for row in rows:
+					row_cells: list[str] = []
+					for cell in row.findall(f"{namespace}tc"):
+						cell_text = "".join(node.text or "" for node in cell.iter(f"{namespace}t"))
+						if cell_text.strip():
+							row_cells.append(cell_text.strip())
+					if row_cells:
+						lines.append(" ".join(row_cells))
+			elif child.tag == f"{namespace}p":
+				text = "".join(node.text or "" for node in child.iter(f"{namespace}t"))
+				if text.strip():
+					lines.append(text.strip())
+		text = "\n".join(lines)
+		return {"body": {"content": [{"paragraph": {"elements": [{"textRun": {"content": text}}]}}]}}
+
+	def _normalize_pdf_schedule_text(self, text: str) -> str:
+		"""Turn PDF table-cell extraction into one logical schedule row per line."""
+		text = text.replace("\ufb00", "ff").replace("\xa0", " ")
+		text = re.sub(r"\s+", " ", text).strip()
+		section_patterns = (
+			r"Monday\s+Bell\s+Schedule",
+			r"Tuesday\s*-\s*Friday\s+Bell\s+Schedule",
+			r"Monday\s*\(\s*Staff\s+Development\s+Day\s*\)\s+Schedule",
+			r"Finals\s+Schedule",
+			r"Dates:",
+			r"1st\s+Semester\s+Finals:",
+			r"2nd\s+Semester\s+Finals:",
+		)
+		for pattern in section_patterns:
+			text = re.sub(f"(?i)({pattern})", r"\n\1", text)
+		row_pattern = r"(Period\s+\d+|PLC\s+Collaboration|Lunch|Staff\s+Development|Break|Make-ups)"
+		text = re.sub(rf"(?i)\s+{row_pattern}\b", r"\n\1", text)
+		return "\n".join(line.strip() for line in text.splitlines() if line.strip())
+
+	def _google_doc_text(self, value) -> str:
+		"""Recursively collect text-run content from a Google Docs API object."""
+		if isinstance(value, dict):
+			if "textRun" in value:
+				return value["textRun"].get("content", "")
+			if "table" in value:
+				table_rows = value["table"].get("tableRows", [])
+				column_count = max(
+					(len(row.get("tableCells", [])) for row in table_rows), default=0
+				)
+				columns = []
+				for column_index in range(column_count):
+					columns.append("\n".join(
+						self._google_doc_text(row.get("tableCells", [])[column_index])
+						for row in table_rows
+						if column_index < len(row.get("tableCells", []))
+					))
+				return "\n".join(columns)
+			return "".join(self._google_doc_text(child) for child in value.values())
+		if isinstance(value, list):
+			return "".join(self._google_doc_text(child) for child in value)
+		return ""
+
+	def _parse_formatted_bell_schedule(self, document: dict) -> list[tuple[str, str, str, str]]:
+		"""Parse the school-year schedule layout with weekday and special-day sections."""
+		lines = [
+			re.sub(r"\s+", " ", line.replace("\xa0", " ").replace("–", "-")).strip()
+			for line in self._google_doc_text(document).splitlines()
+			if line.strip()
+		]
+		year_match = next(
+			(match for line in lines if (match := re.search(r"(20\d{2})\s*-\s*(20\d{2})", line))),
+			None,
+		)
+		if year_match is None:
+			raise ValueError("Could not find a school-year heading such as 2026-2027.")
+		first_year, second_year = int(year_match.group(1)), int(year_match.group(2))
+		sections: dict[str, list[tuple[str, str, str]]] = {}
+		special_dates: dict[str, list[tuple[str, str, str]]] = {}
+		finals_target_dates: set[str] = set()
+		finals_mappings: list[tuple[list[str], list[tuple[list[int], str, str]]]] = []
+		current_finals_dates: list[str] = []
+		current_finals_period_groups: list[tuple[list[int], str, str]] = []
+		current_section: str | None = None
+		current_rows: list[tuple[str, str, str]] = []
+
+		def apply_finals_mapping(date_order: list[str], period_groups: list[tuple[list[int], str, str]]) -> None:
+			if not date_order or len(period_groups) < 2:
+				return
+			first_period_group = period_groups[0]
+			second_period_group = period_groups[1]
+			for day_index, date_text in enumerate(date_order):
+				if day_index >= len(first_period_group[0]) or day_index >= len(second_period_group[0]):
+					continue
+				finals_target_dates.add(date_text)
+				special_dates[date_text] = [
+					(f"Period {first_period_group[0][day_index]}", first_period_group[1], first_period_group[2]),
+					(f"Period {second_period_group[0][day_index]}", second_period_group[1], second_period_group[2]),
+				]
+
+		def save_section() -> None:
+			if current_section and current_rows:
+				sections[current_section] = list(current_rows)
+
+		def date_from_month_day(month_name: str, day_text: str) -> str:
+			month = next(
+				(index for index, name in enumerate(calendar.month_abbr) if name.casefold() == month_name[:3].casefold()),
+				None,
+			)
+			if month is None:
+				raise ValueError(f"Unknown month in Google Doc: {month_name}")
+			year = first_year if month >= 9 else second_year
+			return f"{year:04d}-{month:02d}-{int(day_text):02d}"
+
+		for index, line in enumerate(lines):
+			lower = line.casefold()
+			if lower.startswith("monday (staff development day) schedule"):
+				save_section()
+				current_section, current_rows = "staff", []
+				continue
+			if lower.startswith("monday bell schedule"):
+				save_section()
+				current_section, current_rows = "monday", []
+				continue
+			if re.match(r"tuesday\s*-\s*friday bell schedule", lower):
+				save_section()
+				current_section, current_rows = "tuesday-friday", []
+				continue
+			if lower.startswith("finals schedule"):
+				save_section()
+				current_section, current_rows = "finals", []
+				continue
+			if current_section is None and re.search(r"^(?:period\s+\d+|plc\b|lunch\b)", line, re.IGNORECASE):
+				current_section, current_rows = "monday", []
+			if current_section is None and re.search(r"\d{1,2}:\d{2}", line):
+				current_section, current_rows = "fallback", []
+			if current_section == "staff" and lower.startswith("dates:"):
+				for month_name, day_text in re.findall(r"([A-Za-z]+)\.?\s+(\d{1,2})", line):
+					special_dates[date_from_month_day(month_name, day_text)] = []
+				continue
+			if current_section == "finals":
+				semester_match = re.match(r"(1st|2nd) Semester Finals:\s*(.*)", line, re.IGNORECASE)
+				if semester_match:
+					months_and_days = re.findall(r"([A-Za-z]+)\.?\s+(\d{1,2}(?:\s*,\s*\d{1,2})*)", semester_match.group(2))
+					semester_dates: list[str] = []
+					for month_name, days_text in months_and_days:
+						for day_text in re.findall(r"\d+", days_text):
+							date_text = date_from_month_day(month_name, day_text)
+							semester_dates.append(date_text)
+							special_dates.setdefault(date_text, [])
+					if current_finals_period_groups and semester_dates:
+						finals_mappings.append((list(semester_dates), list(current_finals_period_groups)))
+					current_finals_dates = list(semester_dates)
+					current_finals_period_groups = []
+					continue
+				period_group_match = re.fullmatch(r"Period\s+(\d+)\s+(\d+)\s+(\d+)", line, re.IGNORECASE)
+				if period_group_match and index + 2 < len(lines):
+					period_values = [int(period_group_match.group(1)), int(period_group_match.group(2)), int(period_group_match.group(3))]
+					start_time = self.parse_bell_time(lines[index + 1])
+					end_time = self.parse_bell_time(lines[index + 2])
+					if start_time and end_time:
+						current_finals_period_groups.append((period_values, start_time, end_time))
+						continue
+				if re.match(r"Day\s+\d", line, re.IGNORECASE):
+					continue
+			if current_section is None:
+				continue
+
+			times = re.search(
+				r"(?P<start>\d{1,2}:\d{2}(?:\s?[APap]\.?[Mm]\.?)?)\s*(?:-|–|—|to)?\s*(?P<end>\d{1,2}:\d{2}(?:\s?[APap]\.?[Mm]\.?)?)",
+				line,
+			)
+			if times:
+				period_name = line[:times.start()].strip()
+				start_time = self.parse_bell_time(times.group("start"))
+				end_time = self.parse_bell_time(times.group("end"))
+				if start_time and end_time and not re.search(r"[APap][Mm]", line) and start_time >= end_time and start_time >= "12:00" and end_time < "12:00":
+					end_minutes = int(end_time[0:2]) * 60 + int(end_time[3:5])
+					end_time = f"{(12 + (end_minutes // 60)) % 24:02d}:{end_minutes % 60:02d}"
+				if period_name and start_time and end_time:
+					current_rows.append((period_name, start_time, end_time))
+				continue
+
+			period_match = re.fullmatch(r"(?:period\s+\d+|plc\s+collaboration|lunch)", line, re.IGNORECASE)
+			if period_match and index + 2 < len(lines):
+				first_time = self.parse_bell_time(lines[index + 1])
+				second_time = self.parse_bell_time(lines[index + 2])
+				if first_time and second_time:
+					period_name = line.strip()
+					if period_name and first_time < second_time:
+						current_rows.append((period_name, first_time, second_time))
+					continue
+		save_section()
+		if current_finals_dates and current_finals_period_groups:
+			finals_mappings.append((list(current_finals_dates), list(current_finals_period_groups)))
+		for date_order, period_groups in finals_mappings:
+			apply_finals_mapping(date_order, period_groups)
+		for date_text in list(special_dates):
+			if not special_dates[date_text] and date_text not in finals_target_dates:
+				special_dates[date_text] = list(sections.get("staff", []))
+		parsed_rows: dict[str, list[tuple[str, str, str]]] = {}
+		current = datetime(first_year, 9, 1)
+		last = datetime(second_year, 6, 30)
+		while current <= last:
+			if current.strftime("%Y-%m-%d") in special_dates:
+				rows_for_date = special_dates[current.strftime("%Y-%m-%d")]
+			elif current.weekday() == 0:
+				rows_for_date = sections.get("monday", sections.get("fallback", []))
+			elif current.weekday() in {1, 2, 3, 4}:
+				rows_for_date = sections.get("tuesday-friday", sections.get("fallback", []))
+			else:
+				rows_for_date = []
+			if rows_for_date:
+				parsed_rows[current.strftime("%Y-%m-%d")] = rows_for_date
+			current += timedelta(days=1)
+		# Strip PLC/placeholder rows such as "Period 0" before saving. If a real period starts
+		# earlier than the previous row's end, use the previous end; otherwise keep the actual
+		# AM/PM value for that period.
+		for date_text, date_rows in parsed_rows.items():
+			filtered_rows: list[tuple[str, str, str]] = []
+			plc_start: str | None = None
+			lunch_start: str | None = None
+			first_after_lunch = True
+			uses_24h_time = any(
+				int(start_time[:2]) >= 13 or int(end_time[:2]) >= 13
+				for _, start_time, end_time in date_rows
+			)
+			for period_name, start_time, end_time in date_rows:
+				lower_name = period_name.casefold().strip()
+				if lower_name.startswith("plc") or re.fullmatch(r"(?:period\s*)?0", lower_name):
+					if plc_start is None:
+						plc_start = start_time
+					continue
+				if "lunch" in lower_name:
+					lunch_start = start_time
+					continue
+				if lunch_start is not None and first_after_lunch:
+					if not uses_24h_time:
+						def add_twelve(value: str) -> str:
+							minutes = int(value[0:2]) * 60 + int(value[3:5])
+							return f"{(12 + (minutes // 60)) % 24:02d}:{minutes % 60:02d}"
+						start_time = lunch_start
+						if start_time < "12:00":
+							start_time = add_twelve(start_time)
+						if end_time < "12:00":
+							end_time = add_twelve(end_time)
+					else:
+						start_time = lunch_start
+					first_after_lunch = False
+					filtered_rows.append((period_name, start_time, end_time))
+					continue
+				elif lunch_start is not None and (start_time < "12:00" or end_time < "12:00") and not uses_24h_time:
+					def add_twelve(value: str) -> str:
+						minutes = int(value[0:2]) * 60 + int(value[3:5])
+						return f"{(12 + (minutes // 60)) % 24:02d}:{minutes % 60:02d}"
+					if start_time < "12:00":
+						start_time = add_twelve(start_time)
+					if end_time < "12:00":
+						end_time = add_twelve(end_time)
+				if start_time >= end_time:
+					continue
+				filtered_rows.append((period_name, start_time, end_time))
+			if filtered_rows:
+				if not any(int(row[1][0:2]) >= 12 for row in filtered_rows):
+					filtered_rows.sort(key=lambda row: row[1])
+				normalized_rows: list[tuple[str, str, str]] = []
+				for index, (period_name, start_time, end_time) in enumerate(filtered_rows):
+					lower_name = period_name.strip().casefold()
+					if start_time >= end_time and not (
+						lunch_start is not None and re.fullmatch(r"period\s*5\b", lower_name, flags=re.IGNORECASE)
+					):
+						continue
+					if index == 0 and plc_start is not None and re.fullmatch(r"period\s*1\b", lower_name, flags=re.IGNORECASE):
+						actual_start = plc_start
+					else:
+						actual_start = start_time
+					normalized_rows.append((period_name, actual_start, end_time))
+				filtered_rows = normalized_rows
+			parsed_rows[date_text] = filtered_rows
+		return [
+			(date_text, period_name, start_time, end_time)
+			for date_text, date_rows in parsed_rows.items()
+			for period_name, start_time, end_time in date_rows
+		]
+
+	def import_bell_schedule_from_file(self, show_result: bool = True) -> None:
+		"""Choose and link a downloaded Google Doc export for local bell-schedule imports."""
+		if self.bell_schedule_import_running:
+			return
+		file_path = filedialog.askopenfilename(
+			parent=self.root,
+			title="Choose downloaded bell schedule",
+			filetypes=[
+				("Downloaded Google Doc", "*.pdf *.docx *.txt *.csv"),
+				("PDF document", "*.pdf"),
+				("Word document", "*.docx"),
+				("Text files", "*.txt *.csv"),
+				("All files", "*.*"),
+			],
+		)
+		if not file_path:
+			return
+		self.set_bell_schedule_file(file_path)
+		self.bell_schedule_import_running = True
+		self.google_executor.submit(
+			self._run_with_bell_schedule_lock, self._import_bell_schedule_from_file, show_result
+		)
+
+	def _run_with_bell_schedule_lock(self, func, *args, **kwargs) -> None:
+		"""Run the bell schedule import on the executor thread and always clear its dedicated lock."""
+		try:
+			func(*args, **kwargs)
+		finally:
+			self.bell_schedule_import_running = False
+
+	def _import_bell_schedule_from_file(self, show_result: bool = True) -> None:
+		"""Import a downloaded schedule without making any network or Google API calls."""
+		try:
+			file_path = self.get_bell_schedule_file()
+			if not file_path or not Path(file_path).exists():
+				raise FileNotFoundError("The linked bell schedule download could not be found.")
+			document = self._read_downloaded_bell_schedule(file_path)
+			parsed_rows = self._parse_formatted_bell_schedule(document)
+			if not parsed_rows:
+				raise ValueError("The downloaded document did not contain a recognizable bell schedule.")
+			with self.db_lock:
+				self.database.execute("DELETE FROM bell_periods")
+				self.database.executemany(
+					"INSERT INTO bell_periods (period_date, period_name, start_time, end_time) VALUES (?, ?, ?, ?)",
+					parsed_rows,
+				)
+				self.database.commit()
+			date_count = len({period_date for period_date, _, _, _ in parsed_rows})
+			if self.bell_schedule_refresh_callback:
+				self.root.after(0, self.bell_schedule_refresh_callback)
+			if show_result:
+				self.root.after(0, lambda: messagebox.showinfo(
+					"Bell schedule imported",
+					f"Imported {len(parsed_rows)} period(s) for {date_count} date(s) from the downloaded file.",
+					parent=self.root,
+				))
+		except Exception as error:
+			if show_result:
+				self.root.after(0, lambda: messagebox.showerror(
+					"Bell schedule import failed", str(error), parent=self.root
+				))
+
 	def sync_to_google_sheets(self, show_result: bool = True) -> None:
 		"""Public entry point: export local data to Sheets on the background executor, skipping if one is already running."""
 		if not GOOGLE_SHEETS_ENABLED or not GOOGLE_SPREADSHEET_ID or self.google_sync_running:
@@ -259,7 +647,7 @@ class CheckInSystem:
 
 			rows = self.database.execute(
 				"SELECT items.barcode, items.name, items.category, items.unavailable, "
-				"items.checked_out_by, items.checked_out_at FROM items "
+				"items.checked_out_by, items.checked_out_at, items.checkout_due_at, items.checkout_late FROM items "
 				"LEFT JOIN categories ON categories.name = items.category COLLATE NOCASE "
 				"ORDER BY COALESCE(categories.sort_order, 999999), COALESCE(items.category, '') COLLATE NOCASE, "
 				"CASE "
@@ -267,20 +655,20 @@ class CheckInSystem:
 				"WHEN items.checked_out_by IS NOT NULL THEN 1 "
 				"ELSE 0 END, items.name COLLATE NOCASE"
 			).fetchall()
-			values = [["Barcode", "Item", "Category", "Status", "Checked out by", "Checkout time"]]
+			values = [["Barcode", "Item", "Category", "Status", "Checked out by", "Checkout time", "Checkout due"]]
 			for row in rows:
 				today_reservation = self.get_reservation(row["barcode"])
 				if row["unavailable"]:
 					status = "Unavailable"
 				elif row["checked_out_by"]:
-					status = "Checked out"
+					status = "Late" if row["checkout_late"] else "Checked out"
 				elif today_reservation:
 					status = "Reserved"
 				else:
 					status = "Available"
 				values.append([
 					row["barcode"], row["name"], row["category"] or "Uncategorized", status,
-					row["checked_out_by"] or "", row["checked_out_at"] or "",
+					row["checked_out_by"] or "", row["checked_out_at"] or "", row["checkout_due_at"] or "",
 				])
 			if values != self.last_export_values:
 				worksheet.clear()
@@ -289,7 +677,7 @@ class CheckInSystem:
 				worksheet.add_validation(
 					"D2:D1000",
 					ValidationConditionType.one_of_list,
-					["Available", "Unavailable", "Reserved"],
+					["Available", "Unavailable", "Reserved", "Late"],
 					strict=True,
 					showCustomUi=True,
 				)
@@ -313,7 +701,7 @@ class CheckInSystem:
 			bookings_worksheet = self.get_google_worksheet(GOOGLE_BOOKINGS_WORKSHEET_NAME)
 			booking_rows = self.database.execute(
 				"SELECT reservations.reserved_date, reservations.barcode, reservations.item_name, "
-				"reservations.borrower, reservations.status, items.unavailable, items.checked_out_by "
+				"reservations.borrower, reservations.status, items.unavailable, items.checked_out_by, items.checkout_late "
 				"FROM reservations JOIN items ON items.barcode = reservations.barcode "
 				"ORDER BY reservations.reserved_date, reservations.item_name"
 			).fetchall()
@@ -328,7 +716,7 @@ class CheckInSystem:
 				elif booking["unavailable"]:
 					booking_status = "Unavailable"
 				elif booking["checked_out_by"]:
-					booking_status = "Checked out"
+					booking_status = "Late" if booking["checkout_late"] else "Checked out"
 				elif booking["reserved_date"] <= today:
 					booking_status = "Reserved"
 				else:
@@ -487,7 +875,7 @@ class CheckInSystem:
 						skipped_items.append(f"{barcode} (use the Check Out button for its reservation)")
 					elif item["checked_out_by"] and not borrower:
 						self.database.execute(
-							"UPDATE items SET checked_out_by = NULL, checked_out_at = NULL, unavailable = 0 "
+							"UPDATE items SET checked_out_by = NULL, checked_out_at = NULL, checkout_due_at = NULL, checkout_late = 0, unavailable = 0 "
 							"WHERE barcode = ?",
 							(barcode,),
 						)
@@ -511,10 +899,15 @@ class CheckInSystem:
 					elif item["checked_out_by"] and not self.names_match(item["checked_out_by"], borrower):
 						skipped_items.append(f"{barcode} (already checked out)")
 					elif borrower and not item["checked_out_by"]:
+						period = self.get_active_bell_period() if self.bell_schedule_enabled() else None
+						if self.bell_schedule_enabled() and period is None:
+							skipped_items.append(f"{barcode} (no active bell period)")
+							continue
 						timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+						due_timestamp = f"{period['period_date']} {period['end_time']}" if period else None
 						self.database.execute(
-							"UPDATE items SET checked_out_by = ?, checked_out_at = ? WHERE barcode = ?",
-							(borrower, timestamp, barcode),
+							"UPDATE items SET checked_out_by = ?, checked_out_at = ?, checkout_due_at = ?, checkout_late = 0 WHERE barcode = ?",
+							(borrower, timestamp, due_timestamp, barcode),
 						)
 						self.record_history(barcode, item["name"], "Checked out", borrower)
 						checked_out_count += 1
@@ -794,6 +1187,16 @@ class CheckInSystem:
 		)
 		self.database.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 		self.database.execute(
+			"""CREATE TABLE IF NOT EXISTS bell_periods (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				period_date TEXT NOT NULL,
+				period_name TEXT NOT NULL,
+				start_time TEXT NOT NULL,
+				end_time TEXT NOT NULL,
+				UNIQUE(period_date, period_name)
+			)"""
+		)
+		self.database.execute(
 			"""CREATE TABLE IF NOT EXISTS accounts (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				full_name TEXT NOT NULL,
@@ -837,6 +1240,10 @@ class CheckInSystem:
 			self.database.execute("ALTER TABLE items ADD COLUMN unavailable INTEGER NOT NULL DEFAULT 0")
 		if "category" not in columns:
 			self.database.execute("ALTER TABLE items ADD COLUMN category TEXT")
+		if "checkout_due_at" not in columns:
+			self.database.execute("ALTER TABLE items ADD COLUMN checkout_due_at TEXT")
+		if "checkout_late" not in columns:
+			self.database.execute("ALTER TABLE items ADD COLUMN checkout_late INTEGER NOT NULL DEFAULT 0")
 		category_columns = {column[1] for column in self.database.execute("PRAGMA table_info(categories)")}
 		if "sort_order" not in category_columns:
 			self.database.execute("ALTER TABLE categories ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
@@ -846,6 +1253,524 @@ class CheckInSystem:
 			):
 				self.database.execute("UPDATE categories SET sort_order = ? WHERE name = ?", (index, row["name"]))
 		self.database.commit()
+
+	def get_active_bell_period(self, current: datetime | None = None) -> sqlite3.Row | None:
+		"""Return the bell period containing the current time, if one is configured."""
+		current = current or datetime.now()
+		periods = self.database.execute(
+			"SELECT * FROM bell_periods WHERE period_date = ? ORDER BY start_time",
+			(current.strftime("%Y-%m-%d"),),
+		).fetchall()
+		current_time = current.strftime("%H:%M")
+		for period in periods:
+			if period["start_time"] <= current_time < period["end_time"]:
+				return period
+		return None
+
+	def bell_schedule_enabled(self) -> bool:
+		"""Return whether bell periods control checkout expiration; enabled by default."""
+		setting = self.database.execute(
+			"SELECT value FROM settings WHERE key = 'bell_schedule_enabled'"
+		).fetchone()
+		return setting is None or setting["value"] != "0"
+
+	def set_bell_schedule_enabled(self, enabled: bool) -> None:
+		"""Enable or disable bell-period checkout rules."""
+		if not self.admin_mode:
+			return
+		self.database.execute(
+			"INSERT INTO settings (key, value) VALUES ('bell_schedule_enabled', ?) "
+			"ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+			("1" if enabled else "0",),
+		)
+		if not enabled:
+			self.database.execute(
+				"UPDATE items SET checkout_due_at = NULL, checkout_late = 0 "
+				"WHERE checked_out_by IS NOT NULL"
+			)
+		self.database.commit()
+
+	def parse_bell_time(self, value: str) -> str | None:
+		"""Convert a bell time to internal HH:MM, accepting common 12-hour and PDF-export formats."""
+		if value is None:
+			return None
+		normalized = value.strip().upper()
+		normalized = normalized.replace("A.M.", "AM").replace("P.M.", "PM")
+		normalized = normalized.replace("A.M", "AM").replace("P.M", "PM")
+		normalized = normalized.replace(".", "").replace("–", "-").replace("—", "-")
+		normalized = normalized.replace(" TO ", " ").replace("TO", " ")
+		normalized = normalized.replace("-", " ")
+		normalized = re.sub(r"(?<=\d)(AM|PM)", r" \1", normalized)
+		normalized = re.sub(r"\s+", " ", normalized).strip()
+		variants = []
+		if "AM" in normalized or "PM" in normalized:
+			variants.append(normalized)
+			variants.append(normalized.replace(" AM", "AM").replace(" PM", "PM"))
+		else:
+			variants.append(normalized)
+		for candidate in variants:
+			for time_format in ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%H:%M%p"):
+				try:
+					return datetime.strptime(candidate, time_format).strftime("%H:%M")
+				except ValueError:
+					continue
+		return None
+
+	def format_bell_time(self, value: str) -> str:
+		"""Display an internal HH:MM bell time using a 24-hour clock."""
+		try:
+			return datetime.strptime(value, "%H:%M").strftime("%H:%M")
+		except ValueError:
+			return value
+
+	def checkout_time_display(self, row: sqlite3.Row) -> str:
+		"""Format the checkout period for the item table."""
+		if not row["checked_out_at"]:
+			return ""
+		if not row["checkout_due_at"]:
+			return row["checked_out_at"]
+		return f"{row['checked_out_at']} – {row['checkout_due_at']}"
+
+	def send_checkout_expiry_email(self, recipient: str, subject: str, body: str) -> bool:
+		"""Placeholder for an email provider; return True after a real provider sends successfully."""
+		if not CHECKOUT_EXPIRY_NOTIFICATIONS_ENABLED or not recipient:
+			return False
+		# TODO: Connect an email provider here, then return whether delivery succeeded.
+		return False
+
+	def send_checkout_expiry_message(self, recipient: str, body: str) -> bool:
+		"""Placeholder for an SMS/text provider; return True after a real provider sends successfully."""
+		if not CHECKOUT_EXPIRY_NOTIFICATIONS_ENABLED or not recipient:
+			return False
+		# TODO: Connect an SMS/text provider here, then return whether delivery succeeded.
+		return False
+
+	def notify_checkout_expired(
+		self, borrower: str, item_name: str, due_at: str, email: str | None, phone: str | None
+	) -> None:
+		"""Send the overdue checkout notice through the configured email/message hooks."""
+		due_display = due_at
+		try:
+			due_display = datetime.strptime(due_at, "%Y-%m-%d %H:%M").strftime("%B %d at %I:%M %p").lstrip("0")
+		except ValueError:
+			pass
+		subject = f"Equipment checkout expired: {item_name}"
+		body = (
+			f"Hello {borrower},\n\n"
+			f"Your checkout of {item_name} ended at {due_display}. "
+			"The item has been marked late because it was not returned by the end of the class period.\n\n"
+			"Please contact the equipment desk if you still have the item."
+		)
+		self.send_checkout_expiry_email(email or "", subject, body)
+		self.send_checkout_expiry_message(phone or "", body)
+
+	def expire_due_checkouts(self) -> None:
+		"""Mark overdue items late and notify borrowers, then schedule the next check."""
+		if self.expiration_check_running:
+			return
+		self.expiration_check_running = True
+		changed = False
+		now = datetime.now()
+		now_text = now.strftime("%Y-%m-%d %H:%M")
+		try:
+			with self.db_lock:
+				rows = self.database.execute(
+					"SELECT barcode, name, checked_out_by, checkout_due_at FROM items "
+					"WHERE checked_out_by IS NOT NULL AND checkout_due_at IS NOT NULL "
+					"AND checkout_late = 0 "
+					"AND checkout_due_at <= ?",
+					(now_text,),
+				).fetchall()
+				for row in rows:
+					account = self.database.execute(
+						"SELECT email, phone FROM accounts WHERE full_name = ? COLLATE NOCASE LIMIT 1",
+						(row["checked_out_by"],),
+					).fetchone()
+					self.notify_checkout_expired(
+						row["checked_out_by"], row["name"], row["checkout_due_at"],
+						account["email"] if account else None,
+						account["phone"] if account else None,
+					)
+					self.database.execute(
+						"UPDATE items SET checkout_late = 1 "
+						"WHERE barcode = ? AND checked_out_by IS NOT NULL AND checkout_late = 0",
+						(row["barcode"],),
+					)
+					self.record_history(row["barcode"], row["name"], "Marked late", row["checked_out_by"])
+					self.mark_recently_changed(row["barcode"])
+					changed = True
+				if changed:
+					self.database.commit()
+			if changed:
+				self.refresh_items()
+				self.sync_to_google_sheets(show_result=False)
+		finally:
+			self.expiration_check_running = False
+			self.root.after(30_000, self.expire_due_checkouts)
+
+	def choose_schedule_dates(self, parent: tk.Misc) -> set[str] | None:
+		"""Let an admin select one or more dates from a calendar."""
+		dialog = tk.Toplevel(parent)
+		dialog.title("Choose schedule dates")
+		dialog.resizable(True, False)
+		dialog.transient(parent)
+		dialog.grab_set()
+		frame = ttk.Frame(dialog, padding=14)
+		frame.grid()
+		today = datetime.now()
+		month_year = [today.year, today.month]
+		selected_dates = {today.strftime("%Y-%m-%d")}
+		month_label = tk.StringVar()
+		selection_label = tk.StringVar()
+		calendar_frame = ttk.Frame(frame)
+		calendar_frame.grid(row=1, column=0, columnspan=3, pady=(8, 0))
+
+		def render_calendar() -> None:
+			for child in calendar_frame.winfo_children():
+				child.destroy()
+			year, month = month_year
+			month_label.set(f"{calendar.month_name[month]} {year}")
+			for column, day_name in enumerate(calendar.day_abbr):
+				ttk.Label(calendar_frame, text=day_name).grid(row=0, column=column, padx=4, pady=3)
+			for row_number, week in enumerate(calendar.monthcalendar(year, month), start=1):
+				for column, day in enumerate(week):
+					if not day:
+						tk.Label(calendar_frame, text="", width=4).grid(
+							row=row_number, column=column, padx=2, pady=2
+						)
+						continue
+					date_text = f"{year:04d}-{month:02d}-{day:02d}"
+					is_selected = date_text in selected_dates
+					date_cell = tk.Label(
+						calendar_frame, text=str(day), width=4, height=2,
+						bg="#5b9bf7" if is_selected else "#ffffff",
+						fg="#000000", relief="solid" if is_selected else "flat", borderwidth=1,
+					)
+					date_cell.grid(row=row_number, column=column, padx=2, pady=2)
+					date_cell.bind(
+						"<Button-1>",
+						lambda _event, value=date_text: toggle_date(value),
+					)
+			selection_label.set(f"{len(selected_dates)} date(s) selected")
+
+		def toggle_date(date_text: str) -> None:
+			if date_text in selected_dates and len(selected_dates) > 1:
+				selected_dates.remove(date_text)
+			else:
+				selected_dates.add(date_text)
+			render_calendar()
+
+		def change_month(offset: int) -> None:
+			month_year[1] += offset
+			if month_year[1] == 0:
+				month_year[1], month_year[0] = 12, month_year[0] - 1
+			elif month_year[1] == 13:
+				month_year[1], month_year[0] = 1, month_year[0] + 1
+			render_calendar()
+
+		tk.Button(frame, text="<", command=lambda: change_month(-1)).grid(row=0, column=0)
+		ttk.Label(frame, textvariable=month_label, width=22, anchor="center").grid(row=0, column=1)
+		tk.Button(frame, text=">", command=lambda: change_month(1)).grid(row=0, column=2)
+		tk.Label(
+			frame, text="Click dates to select them. Select several dates for the same schedule.",
+			foreground="#555555",
+		).grid(row=2, column=0, columnspan=3, pady=(8, 2))
+		tk.Label(frame, textvariable=selection_label, foreground="#555555").grid(
+			row=3, column=0, columnspan=3
+		)
+		result: list[set[str] | None] = [None]
+		def use_dates() -> None:
+			result[0] = set(selected_dates)
+			dialog.destroy()
+		ttk.Button(frame, text="Use selected dates", command=use_dates).grid(
+			row=4, column=2, pady=(10, 0)
+		)
+		render_calendar()
+		dialog.wait_window()
+		return result[0]
+
+	def manage_bell_schedule_dialog(self) -> None:
+		"""Admin-only editor for bell periods that can vary by date."""
+		if not self.admin_mode:
+			return
+		dialog = tk.Toplevel(self.root)
+		dialog.title("Manage bell schedule")
+		dialog.geometry("860x700")
+		dialog.minsize(760, 620)
+		dialog.transient(self.root)
+		frame = ttk.Frame(dialog, padding=12)
+		frame.pack(fill="both", expand=True)
+		toggle_label = tk.StringVar()
+
+		def refresh_toggle_label() -> None:
+			toggle_label.set(
+				"Disable Bell Schedule" if self.bell_schedule_enabled() else "Enable Bell Schedule"
+			)
+
+		def toggle_bell_schedule() -> None:
+			enabled = self.bell_schedule_enabled()
+			if enabled and not messagebox.askyesno(
+				"Disable bell schedule",
+				"Disable period-based checkout expiration? Current due and late flags will be cleared.",
+				parent=dialog,
+			):
+				return
+			self.set_bell_schedule_enabled(not enabled)
+			refresh_toggle_label()
+			self.refresh_items()
+			if self.selected_barcode:
+				row = self.database.execute(
+					"SELECT * FROM items WHERE barcode = ?", (self.selected_barcode,)
+				).fetchone()
+				if row:
+					self.show_item(row)
+
+		ttk.Button(frame, textvariable=toggle_label, command=toggle_bell_schedule).pack(
+			anchor="e", pady=(0, 8)
+		)
+		refresh_toggle_label()
+		today = datetime.now()
+		month_year = [today.year, today.month]
+		selected_date = [today.strftime("%Y-%m-%d")]
+		month_label = tk.StringVar()
+		selected_date_label = tk.StringVar()
+		calendar_frame = ttk.Frame(frame)
+		calendar_frame.pack(fill="x")
+		calendar_header = ttk.Frame(frame)
+		calendar_header.pack(fill="x")
+		tk.Button(calendar_header, text="<", command=lambda: change_month(-1)).pack(side="left")
+		ttk.Label(calendar_header, textvariable=month_label, width=24, anchor="center").pack(side="left", expand=True)
+		tk.Button(calendar_header, text=">", command=lambda: change_month(1)).pack(side="right")
+		tk.Label(
+			frame, text="Click a date to view its bell schedule. Highlighted dates have a schedule.",
+			foreground="#555555",
+		).pack(anchor="w", pady=(4, 8))
+		table = ttk.Treeview(
+			frame, columns=("date", "period", "start", "end"), show="headings", selectmode="browse"
+		)
+		for column, heading, width in (
+			("date", "Date", 120), ("period", "Period", 180),
+			("start", "Starts", 100), ("end", "Ends", 100),
+		):
+			table.heading(column, text=heading)
+			table.column(column, width=width, anchor="w")
+		table.pack(fill="both", expand=True, pady=(4, 0))
+
+		def select_date(date_text: str) -> None:
+			selected_date[0] = date_text
+			reload_periods()
+			render_calendar()
+
+		def render_calendar() -> None:
+			for child in calendar_frame.winfo_children():
+				child.destroy()
+			year, month = month_year
+			month_label.set(f"{calendar.month_name[month]} {year}")
+			scheduled_dates = {
+				row["period_date"] for row in self.database.execute(
+					"SELECT DISTINCT period_date FROM bell_periods"
+				).fetchall()
+			}
+			for column, day_name in enumerate(calendar.day_abbr):
+				ttk.Label(calendar_frame, text=day_name).grid(row=0, column=column, padx=8, pady=3)
+			for row_number, week in enumerate(calendar.monthcalendar(year, month), start=1):
+				for column, day in enumerate(week):
+					if not day:
+						tk.Label(calendar_frame, text="", width=7).grid(
+							row=row_number, column=column, padx=3, pady=3
+						)
+						continue
+					date_text = f"{year:04d}-{month:02d}-{day:02d}"
+					is_selected = date_text == selected_date[0]
+					has_schedule = date_text in scheduled_dates
+					date_cell = tk.Label(
+						calendar_frame,
+						text=f"{day}\n●" if has_schedule else str(day),
+						width=7, height=2,
+						bg="#5b9bf7" if is_selected else "#fff0cc" if has_schedule else "#ffffff",
+						fg="#000000", relief="solid" if is_selected else "flat", borderwidth=1,
+					)
+					date_cell.grid(row=row_number, column=column, padx=3, pady=3)
+					date_cell.bind("<Button-1>", lambda _event, value=date_text: select_date(value))
+			selected_date_label.set(f"Schedule for {selected_date[0]}")
+
+		def change_month(offset: int) -> None:
+			month_year[1] += offset
+			if month_year[1] == 0:
+				month_year[1], month_year[0] = 12, month_year[0] - 1
+			elif month_year[1] == 13:
+				month_year[1], month_year[0] = 1, month_year[0] + 1
+			render_calendar()
+
+		tk.Label(frame, textvariable=selected_date_label, font=("Segoe UI", 11, "bold")).pack(
+			anchor="w", pady=(4, 0)
+		)
+
+		def reload_periods() -> None:
+			for row_id in table.get_children():
+				table.delete(row_id)
+			for period in self.database.execute(
+				"SELECT * FROM bell_periods WHERE period_date = ? ORDER BY start_time",
+				(selected_date[0],),
+			).fetchall():
+				table.insert("", "end", iid=str(period["id"]), values=(
+					period["period_date"], period["period_name"],
+					self.format_bell_time(period["start_time"]), self.format_bell_time(period["end_time"]),
+				))
+
+		def period_values(existing: sqlite3.Row | None = None) -> tuple[str, str, str, str] | None:
+			defaults = (
+				existing["period_date"] if existing else datetime.now().strftime("%Y-%m-%d"),
+				existing["period_name"] if existing else "Period 1",
+				self.format_bell_time(existing["start_time"]) if existing else "08:00",
+				self.format_bell_time(existing["end_time"]) if existing else "08:50",
+			)
+			values = []
+			for label, default in zip(("Date (YYYY-MM-DD)", "Period name", "Start time (e.g. 08:00)", "End time (e.g. 08:50)"), defaults):
+				value = simpledialog.askstring("Bell schedule", label, initialvalue=default, parent=dialog)
+				if value is None:
+					return None
+				values.append(value.strip())
+			try:
+				datetime.strptime(values[0], "%Y-%m-%d")
+				start_time = self.parse_bell_time(values[2])
+				end_time = self.parse_bell_time(values[3])
+			except ValueError:
+				messagebox.showwarning("Invalid schedule", "Use dates as YYYY-MM-DD and times such as 08:00 or 13:30.", parent=dialog)
+				return None
+			if not start_time or not end_time:
+				messagebox.showwarning("Invalid schedule", "Use times such as 08:00 or 13:30.", parent=dialog)
+				return None
+			if not values[1] or start_time >= end_time:
+				messagebox.showwarning("Invalid schedule", "Enter a period name and make sure the end is after the start.", parent=dialog)
+				return None
+			return values[0], values[1], start_time, end_time
+
+		def add_period() -> None:
+			dates = self.choose_schedule_dates(dialog)
+			if not dates:
+				return
+			period_name = simpledialog.askstring("Bell schedule", "Period name:", initialvalue="Period 1", parent=dialog)
+			start_time = simpledialog.askstring("Bell schedule", "Start time (e.g. 08:00):", initialvalue="08:00", parent=dialog)
+			end_time = simpledialog.askstring("Bell schedule", "End time (e.g. 08:50):", initialvalue="08:50", parent=dialog)
+			if None in (period_name, start_time, end_time):
+				return
+			period_name, start_time, end_time = period_name.strip(), start_time.strip(), end_time.strip()
+			start_time = self.parse_bell_time(start_time)
+			end_time = self.parse_bell_time(end_time)
+			if not start_time or not end_time:
+				messagebox.showwarning("Invalid schedule", "Use times such as 08:00 or 13:30.", parent=dialog)
+				return
+			if not period_name or start_time >= end_time:
+				messagebox.showwarning("Invalid schedule", "Enter a period name and make sure the end is after the start.", parent=dialog)
+				return
+			try:
+				for period_date in sorted(dates):
+					self.database.execute(
+						"INSERT INTO bell_periods (period_date, period_name, start_time, end_time) VALUES (?, ?, ?, ?)",
+						(period_date, period_name, start_time, end_time),
+					)
+				self.database.commit()
+			except sqlite3.IntegrityError:
+				self.database.rollback()
+				messagebox.showwarning("Duplicate period", "That period name already exists for one of the selected dates.", parent=dialog)
+				dialog.lift()
+				return
+			reload_periods()
+			render_calendar()
+
+		def edit_period() -> None:
+			selection = table.selection()
+			if not selection:
+				return
+			period = self.database.execute("SELECT * FROM bell_periods WHERE id = ?", (selection[0],)).fetchone()
+			values = period_values(period)
+			if values is None:
+				return
+			try:
+				self.database.execute(
+					"UPDATE bell_periods SET period_date = ?, period_name = ?, start_time = ?, end_time = ? WHERE id = ?",
+					(*values, period["id"]),
+				)
+				self.database.commit()
+			except sqlite3.IntegrityError:
+				messagebox.showwarning("Duplicate period", "That period name already exists for this date.", parent=dialog)
+				dialog.lift()
+				return
+			reload_periods()
+			render_calendar()
+
+		def delete_period() -> None:
+			selection = table.selection()
+			if selection and messagebox.askyesno("Delete period", "Delete the selected bell period?", parent=dialog):
+				self.database.execute("DELETE FROM bell_periods WHERE id = ?", (selection[0],))
+				self.database.commit()
+				reload_periods()
+				render_calendar()
+
+		def copy_schedule() -> None:
+			periods = self.database.execute(
+				"SELECT period_name, start_time, end_time FROM bell_periods "
+				"WHERE period_date = ? ORDER BY start_time",
+				(selected_date[0],),
+			).fetchall()
+			if not periods:
+				messagebox.showinfo(
+					"No schedule to copy",
+					f"There is no bell schedule saved for {selected_date[0]}.",
+					parent=dialog,
+				)
+				return
+			target_dates = self.choose_schedule_dates(dialog)
+			if not target_dates:
+				return
+			target_dates.discard(selected_date[0])
+			if not target_dates:
+				messagebox.showinfo(
+					"Choose another date", "Select at least one date besides the source schedule.", parent=dialog
+				)
+				return
+			if not messagebox.askyesno(
+				"Copy bell schedule",
+				f"Copy the {len(periods)} period(s) from {selected_date[0]} to "
+				f"{len(target_dates)} date(s)? Existing schedules on those dates will be replaced.",
+				parent=dialog,
+			):
+				return
+			with self.db_lock:
+				for target_date in sorted(target_dates):
+					self.database.execute("DELETE FROM bell_periods WHERE period_date = ?", (target_date,))
+					for period in periods:
+						self.database.execute(
+							"INSERT INTO bell_periods (period_date, period_name, start_time, end_time) "
+							"VALUES (?, ?, ?, ?)",
+							(target_date, period["period_name"], period["start_time"], period["end_time"]),
+						)
+				self.database.commit()
+			reload_periods()
+			render_calendar()
+
+		buttons = ttk.Frame(frame)
+		buttons.pack(fill="x", pady=(8, 0))
+		self.bell_schedule_refresh_callback = lambda: (reload_periods(), render_calendar())
+
+		def close_schedule_dialog() -> None:
+			self.bell_schedule_refresh_callback = None
+			dialog.destroy()
+
+		left_buttons = ttk.Frame(buttons)
+		left_buttons.pack(side="left")
+		ttk.Button(left_buttons, text="Add period", command=add_period).pack(side="left")
+		ttk.Button(
+			left_buttons, text="Import Downloaded Schedule",
+			command=lambda: self.import_bell_schedule_from_file(True),
+		).pack(side="left", padx=(8, 0))
+		ttk.Button(left_buttons, text="Copy Schedule", command=copy_schedule).pack(side="left", padx=(8, 0))
+		ttk.Button(left_buttons, text="Edit", command=edit_period).pack(side="left", padx=(8, 0))
+		ttk.Button(left_buttons, text="Delete", command=delete_period).pack(side="left", padx=(8, 0))
+		ttk.Button(buttons, text="Close", command=close_schedule_dialog).pack(side="right")
+		render_calendar()
+		reload_periods()
 
 	def get_categories(self) -> list[str]:
 		"""Return the admin-defined categories in priority order (alphabetical as a tiebreaker)."""
@@ -1116,6 +2041,7 @@ class CheckInSystem:
 			self.add_button, self.edit_button, self.photo_button,
 			self.unavailable_button, self.delete_button, self.history_button,
 			self.category_button, self.export_button, self.manage_accounts_button,
+			self.bell_schedule_button,
 		)
 		for button in admin_only_buttons:
 			if self.admin_mode:
@@ -1133,6 +2059,7 @@ class CheckInSystem:
 			self.category_button.state(["!disabled"])
 			self.export_button.state(["!disabled"])
 			self.manage_accounts_button.state(["!disabled"])
+			self.bell_schedule_button.state(["!disabled"])
 		self.checkout_button.configure(state="normal" if self.selected_barcode else "disabled")
 		self.checkin_button.configure(state="normal" if self.selected_barcode else "disabled")
 		self.book_button.state(["!disabled"] if self.selected_barcode else ["disabled"])
@@ -1617,6 +2544,10 @@ class CheckInSystem:
 			header, text="Manage Accounts", command=self.manage_accounts_dialog, state="disabled"
 		)
 		self.manage_accounts_button.grid(row=0, column=7, rowspan=2, padx=(8, 0))
+		self.bell_schedule_button = ttk.Button(
+			header, text="Bell Schedule", command=self.manage_bell_schedule_dialog, state="disabled"
+		)
+		self.bell_schedule_button.grid(row=0, column=8, rowspan=2, padx=(8, 0))
 
 		scan_frame = ttk.LabelFrame(self.root, text="Scan item", padding=14)
 		scan_frame.grid(row=1, column=0, padx=20, pady=8, sticky="ew")
@@ -1806,14 +2737,16 @@ class CheckInSystem:
 			if row["unavailable"]:
 				status, row_tag = "Unavailable", "unavailable"
 			elif row["checked_out_by"]:
-				status, row_tag = "Checked out", "checked_out"
+				status, row_tag = (
+					("Late", "checked_out") if row["checkout_late"] else ("Checked out", "checked_out")
+				)
 			elif today_reservation:
 				status, row_tag = "Reserved", "reserved"
 			else:
 				status, row_tag = "Available", "available"
 			self.items_table.insert("", "end", iid=row["barcode"], values=(
 				row["barcode"], row["name"], row["category"] or "Uncategorized", status,
-				row["checked_out_by"] or "", row["checked_out_at"] or "",
+				row["checked_out_by"] or "", self.checkout_time_display(row),
 			), tags=(row_tag,))
 
 	def scan_item(self, event_or_barcode: tk.Event | str | None = None, force: bool = False) -> None:
@@ -1987,7 +2920,9 @@ class CheckInSystem:
 		if row["unavailable"]:
 			status = "Unavailable"
 		elif row["checked_out_by"]:
-			status = "Checked out"
+			status = "Late" if row["checkout_late"] else "Checked out"
+			if row["checkout_due_at"]:
+				status += f" until {row['checkout_due_at']}"
 		elif self.get_reservation(row["barcode"]):
 			status = "Reserved"
 		else:
@@ -2027,7 +2962,7 @@ class CheckInSystem:
 			if row["unavailable"]:
 				status = "Unavailable"
 			elif row["checked_out_by"]:
-				status = "Checked out"
+				status = "Late" if row["checkout_late"] else "Checked out"
 			else:
 				status = "Available"
 			self.multi_scan_table.insert("", "end", iid=barcode, values=(barcode, row["name"], status))
@@ -2052,8 +2987,18 @@ class CheckInSystem:
 		account = self.resolve_borrower_account(self.root)
 		if account is None:
 			return
+		schedule_enabled = self.bell_schedule_enabled()
+		checkout_mode = "period"
+		if schedule_enabled:
+			checkout_mode = self.choose_checkout_duration(self.root)
+			due_at = self.checkout_due_time(checkout_mode) if schedule_enabled else None
+		else:
+			due_at = None
+		if schedule_enabled and due_at is None:
+			return
 		borrower = account["full_name"]
 		timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+		due_timestamp = due_at.strftime("%Y-%m-%d %H:%M") if due_at else None
 		checked_out: list[str] = []
 		skipped: list[str] = []
 		with self.db_lock:
@@ -2073,8 +3018,8 @@ class CheckInSystem:
 						continue
 					
 					self.database.execute(
-						"UPDATE items SET checked_out_by = ?, checked_out_at = ? WHERE barcode = ?",
-						(borrower, timestamp, barcode),
+						"UPDATE items SET checked_out_by = ?, checked_out_at = ?, checkout_due_at = ?, checkout_late = 0 WHERE barcode = ?",
+						(borrower, timestamp, due_timestamp, barcode),
 					)
 					self.record_history(barcode, item["name"], "Checked out", borrower)
 					self.mark_recently_changed(barcode)
@@ -2115,7 +3060,7 @@ class CheckInSystem:
 						continue
 					
 					update = self.database.execute(
-						"UPDATE items SET checked_out_by = NULL, checked_out_at = NULL "
+						"UPDATE items SET checked_out_by = NULL, checked_out_at = NULL, checkout_due_at = NULL, checkout_late = 0 "
 						"WHERE barcode = ? AND checked_out_by IS NOT NULL",
 						(barcode,),
 					)
@@ -2259,6 +3204,73 @@ class CheckInSystem:
 			if row:
 				self.show_item(row)
 
+	def checkout_due_time(self, mode: str = "period", current: datetime | None = None) -> datetime | None:
+		"""Return the due time for a new checkout, either this period or the next school-day first period."""
+		current = current or datetime.now()
+		if mode == "day":
+			next_day = self.database.execute(
+				"SELECT period_date FROM bell_periods WHERE period_date > ? ORDER BY period_date, start_time LIMIT 1",
+				(current.strftime("%Y-%m-%d"),),
+			).fetchone()
+			if next_day is None:
+				messagebox.showwarning(
+					"No next school day",
+					"Add the next school day to the bell schedule before allowing full-day checkouts.",
+					parent=self.root,
+				)
+				return None
+			first_period = self.database.execute(
+				"SELECT * FROM bell_periods WHERE period_date = ? ORDER BY start_time LIMIT 1",
+				(next_day["period_date"],),
+			).fetchone()
+			if first_period is None:
+				messagebox.showwarning(
+					"No bell schedule for next day",
+					"The next school day is missing a bell schedule, so full-day checkout cannot be assigned.",
+					parent=self.root,
+				)
+				return None
+			return datetime.strptime(
+				f"{first_period['period_date']} {first_period['end_time']}", "%Y-%m-%d %H:%M"
+			)
+		period = self.get_active_bell_period(current)
+		if period is None:
+			messagebox.showwarning(
+				"No active class period",
+				"An admin must add the current date's bell schedule before checking out equipment.",
+				parent=self.root,
+			)
+			return None
+		return datetime.strptime(
+			f"{period['period_date']} {period['end_time']}", "%Y-%m-%d %H:%M"
+		)
+
+	def choose_checkout_duration(self, parent: tk.Misc | None = None) -> str:
+		"""Let the user choose whether a checkout is for a single period or the whole day."""
+		selected = {"value": "period"}
+		dialog = tk.Toplevel(parent or self.root)
+		dialog.title("Checkout duration")
+		dialog.transient(parent or self.root)
+		dialog.grab_set()
+		dialog.resizable(False, False)
+		frame = ttk.Frame(dialog, padding=16)
+		frame.pack()
+		tk.Label(frame, text="How long should this checkout last?", font=(None, 11, "bold")).grid(
+			row=0, column=0, columnspan=2, sticky="w", pady=(0, 12)
+		)
+		def choose(mode: str) -> None:
+			selected["value"] = mode
+			dialog.destroy()
+		button_padx = {"padx": 8, "pady": 6}
+		tk.Button(frame, text="Entire day", width=16, command=lambda: choose("day")).grid(
+			row=1, column=0, **button_padx
+		)
+		tk.Button(frame, text="Of the period", width=16, command=lambda: choose("period")).grid(
+			row=1, column=1, **button_padx
+		)
+		dialog.wait_window()
+		return selected["value"]
+
 	def check_out(self) -> None:
 		"""Check the selected item out to the typed borrower.
 
@@ -2275,6 +3287,15 @@ class CheckInSystem:
 			return
 		account = self.resolve_borrower_account(self.root)
 		if account is None:
+			return
+		schedule_enabled = self.bell_schedule_enabled()
+		checkout_mode = "period"
+		if schedule_enabled:
+			checkout_mode = self.choose_checkout_duration(self.root)
+			due_at = self.checkout_due_time(checkout_mode) if schedule_enabled else None
+		else:
+			due_at = None
+		if schedule_enabled and due_at is None:
 			return
 		succeeded = False
 		borrower = account["full_name"]
@@ -2293,9 +3314,11 @@ class CheckInSystem:
 				)
 				return
 			timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+			due_timestamp = due_at.strftime("%Y-%m-%d %H:%M") if due_at else None
 			update = self.database.execute(
-				"UPDATE items SET checked_out_by = ?, checked_out_at = ? WHERE barcode = ? AND checked_out_by IS NULL",
-				(borrower, timestamp, self.selected_barcode),
+				"UPDATE items SET checked_out_by = ?, checked_out_at = ?, checkout_due_at = ?, checkout_late = 0 "
+				"WHERE barcode = ? AND checked_out_by IS NULL",
+				(borrower, timestamp, due_timestamp, self.selected_barcode),
 			)
 			# Only report success if the row actually changed; a background Google
 			# Sheets sync could have checked this item out moments earlier.
@@ -2316,7 +3339,10 @@ class CheckInSystem:
 				"This item was just checked out or changed by someone else. Its current status is now shown.",
 			)
 			return
-		self.finish_action(f"Item checked out to {borrower}.")
+		message = f"Item checked out to {borrower}."
+		if due_at:
+			message = f"Item checked out to {borrower} until {due_at.strftime('%I:%M %p').lstrip('0')}."
+		self.finish_action(message)
 
 	def check_in(self) -> None:
 		"""Check the selected item back in, the same race-safe way as check_out."""
@@ -2334,7 +3360,7 @@ class CheckInSystem:
 			).fetchone()
 			was_checked_out = bool(item and item["checked_out_by"])
 			update = self.database.execute(
-				"UPDATE items SET checked_out_by = NULL, checked_out_at = NULL "
+				"UPDATE items SET checked_out_by = NULL, checked_out_at = NULL, checkout_due_at = NULL, checkout_late = 0 "
 				"WHERE barcode = ? AND checked_out_by IS NOT NULL",
 				(self.selected_barcode,),
 			)
