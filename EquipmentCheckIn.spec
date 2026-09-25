@@ -5,7 +5,7 @@ a = Analysis(
     ['coolscaner.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('google-service-account.json', '.')],
     hiddenimports=['pypdf'],
     hookspath=[],
     hooksconfig={},
