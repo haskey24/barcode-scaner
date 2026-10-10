@@ -1,6 +1,8 @@
 # Secrets and local data
 google-service-account.json
 check_in_system.db
+equipment_checkin.db
+web_service/inventory_dev.db
 database_backups/
 
 # Python local files

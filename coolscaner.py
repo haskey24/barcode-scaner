@@ -1,8 +1,8 @@
 """Simple USB barcode check-in/check-out system.
 
 Most USB barcode scanners work as a keyboard: they type the barcode and press
-Enter. Keep the cursor in the scan box and the item will be selected.
-
+		smtp_password_entry = ttk.Entry(frame, show="*", width=38)
+		smtp_password_entry.grid(row=row, column=1, sticky="ew", pady=3)
 Data is stored locally in a SQLite database (see DATABASE_FILE) and, if
 configured, mirrored to a Google Sheet in the background: an "Item Info" tab
 (current status), a "History" tab (every check-in/out), a "Bookings" tab
@@ -16,24 +16,31 @@ without touching the live database. See parse_arguments()/DATABASE_FILE below.
 """
 
 import argparse
+import base64
 from datetime import datetime, timedelta
 import calendar
 import hashlib
+import json
+from email.message import EmailMessage
+import logging
+import os
 from pathlib import Path
 import re
 import secrets
 import shutil
+import smtplib
 import subprocess
 import sys
 import threading
 import time
 import sqlite3
+from urllib.parse import quote, urlencode, urlsplit
+from urllib.request import Request, urlopen
 import zipfile
 from xml.etree import ElementTree
 from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
-
 from PIL import Image, ImageTk
 
 
@@ -89,18 +96,85 @@ GOOGLE_HISTORY_WORKSHEET_NAME = "History"
 GOOGLE_BOOKINGS_WORKSHEET_NAME = "Bookings"
 GOOGLE_BOOKING_REQUESTS_WORKSHEET_NAME = "Make Bookings"
 GOOGLE_SYNC_INTERVAL_MS = 10_000
+WEB_API_SYNC_INTERVAL_MS = 10_000
+SELECTION_CLEAR_DELAY_MS = 3 * 60 * 1000
 # How long a barcode is protected from sheet-driven changes after a local
 # check-in/out, covering one export cycle plus network latency.
 LOCAL_CHANGE_GRACE_SECONDS = (GOOGLE_SYNC_INTERVAL_MS / 1000) * 2
-BOOKING_REQUEST_DELETE_GRACE_SECONDS = 5 * 60
-# Notification sending is intentionally disabled until an email/SMS provider is configured.
-CHECKOUT_EXPIRY_NOTIFICATIONS_ENABLED = False
+BOOKING_DELETE_GRACE_SECONDS = 5 * 60
+NOTIFICATION_KEYRING_SERVICE = "EquipmentCheckIn.Notifications"
 # USB scanners in keyboard mode normally send a barcode much faster than a
 # person can type.  These values let us distinguish a scanner burst from
 # ordinary typing in another field.
 SCAN_BURST_GAP_SECONDS = 0.15
 SCAN_MAX_AVERAGE_KEY_INTERVAL_SECONDS = 0.05
 SCAN_MIN_CHARACTERS = 3
+WEB_API_BASE_URL = os.environ.get("EQUIPMENT_CHECKIN_API_URL", "").strip()
+WEB_API_EMAIL = os.environ.get("EQUIPMENT_CHECKIN_API_EMAIL", "").strip()
+WEB_API_PASSWORD = os.environ.get("EQUIPMENT_CHECKIN_API_PASSWORD", "").strip()
+WEB_API_INVENTORY_ID = os.environ.get("EQUIPMENT_CHECKIN_API_INVENTORY_ID", "")
+
+
+def build_web_service_import_payload(database_path: str | Path) -> dict:
+	"""Collect the local SQLite inventory into the payload expected by the hosted API import route."""
+	database_path = Path(database_path)
+	if not database_path.exists():
+		return {"items": [], "borrowers": [], "reservations": [], "history": [], "categories": [], "bell_periods": []}
+	payload = {"items": [], "borrowers": [], "reservations": [], "history": [], "categories": [], "bell_periods": []}
+	with sqlite3.connect(database_path) as database:
+		database.row_factory = sqlite3.Row
+		for table_name in ("categories", "items", "borrowers", "reservations", "checkout_history", "bell_periods"):
+			try:
+				if database.execute(f"SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,)).fetchone() is None:
+					continue
+			except sqlite3.DatabaseError:
+				continue
+		if database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='categories'").fetchone() is not None:
+			for row in database.execute("SELECT name, sort_order FROM categories ORDER BY sort_order, name COLLATE NOCASE").fetchall():
+				payload["categories"].append({"name": row["name"], "sort_order": row["sort_order"]})
+		if database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='items'").fetchone() is not None:
+			for row in database.execute(
+				"SELECT barcode, name, category, unavailable, missing, checked_out_by, checked_out_at, checkout_due_at, checkout_late FROM items ORDER BY name COLLATE NOCASE"
+			).fetchall():
+				payload["items"].append({
+					"barcode": row["barcode"], "name": row["name"], "category": row["category"],
+					"unavailable": bool(row["unavailable"]), "missing": bool(row["missing"]),
+					"checked_out_by": row["checked_out_by"], "checked_out_at": row["checked_out_at"],
+					"checkout_due_at": row["checkout_due_at"], "checkout_late": bool(row["checkout_late"]),
+				})
+		borrower_table = next((
+			table_name for table_name in ("accounts", "borrowers")
+			if database.execute(
+				"SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+			).fetchone() is not None
+		), None)
+		if borrower_table:
+			for row in database.execute(
+				f"SELECT full_name, student_id, email, phone, sms_opt_in FROM {borrower_table} ORDER BY full_name COLLATE NOCASE"
+			).fetchall():
+				payload["borrowers"].append({
+					"full_name": row["full_name"], "student_id": row["student_id"], "email": row["email"] or "",
+					"phone": row["phone"] or "", "sms_opt_in": bool(row["sms_opt_in"]),
+				})
+		if database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reservations'").fetchone() is not None:
+			for row in database.execute("SELECT barcode, item_name, reserved_date, borrower, created_at, status FROM reservations ORDER BY reserved_date, item_name COLLATE NOCASE").fetchall():
+				payload["reservations"].append({
+					"barcode": row["barcode"], "item_name": row["item_name"], "reserved_date": row["reserved_date"],
+					"borrower": row["borrower"], "created_at": row["created_at"], "status": row["status"],
+				})
+		if database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='checkout_history'").fetchone() is not None:
+			for row in database.execute("SELECT barcode, item_name, action, borrower, timestamp FROM checkout_history ORDER BY rowid DESC").fetchall():
+				payload["history"].append({
+					"barcode": row["barcode"], "item_name": row["item_name"], "action": row["action"],
+					"borrower": row["borrower"], "timestamp": row["timestamp"],
+				})
+		if database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bell_periods'").fetchone() is not None:
+			for row in database.execute("SELECT period_date, period_name, start_time, end_time FROM bell_periods ORDER BY period_date, start_time").fetchall():
+				payload["bell_periods"].append({
+					"period_date": row["period_date"], "period_name": row["period_name"],
+					"start_time": row["start_time"], "end_time": row["end_time"],
+				})
+	return payload
 
 
 class CheckInSystem:
@@ -136,9 +210,13 @@ class CheckInSystem:
 		self.item_category = tk.StringVar(value="")
 		self.borrower_name = tk.StringVar()
 		self.search_value = tk.StringVar()
-		self.tips_and_rules_text = None
-		self.multi_scan_enabled = tk.BooleanVar(value=False)
 		self.multi_scan_queue: list[str] = []
+		self.selection_clear_after_id: str | None = None
+		self.item_selection_vars: dict[str, tk.BooleanVar] = {}
+		self.item_row_images: list[ImageTk.PhotoImage] = []
+		self.item_base_order: list[str] = []
+		self.item_row_frames: dict[str, ttk.Frame] = {}
+		self.item_row_separators: dict[str, ttk.Separator] = {}
 		self.audit_mode = tk.BooleanVar(value=False)
 		self.audit_items_scanned: list[str] = []
 		self.audit_total_expected: int = 0
@@ -150,6 +228,8 @@ class CheckInSystem:
 		self.last_history_export_values = None
 		self.last_bookings_export_values = None
 		self.google_executor = ThreadPoolExecutor(max_workers=1)
+		self.web_api_executor = ThreadPoolExecutor(max_workers=1)
+		self.notification_executor = ThreadPoolExecutor(max_workers=2)
 		self.google_sync_running = False
 		self.google_import_running = False
 		self.bell_schedule_import_running = False
@@ -162,12 +242,34 @@ class CheckInSystem:
 		self.recently_changed_barcodes: dict[str, float] = {}
 		self.audit_progress = tk.DoubleVar(value=0.0)
 		self.audit_status_label = tk.StringVar(value="Progress: 0 / 0")
+		self.web_api_base_url = WEB_API_BASE_URL
+		self.web_api_email = WEB_API_EMAIL
+		self.web_api_password = WEB_API_PASSWORD
+		self.web_api_inventory_id = WEB_API_INVENTORY_ID
+		self.web_api_base_url = self.get_setting("web_api_base_url", self.web_api_base_url)
+		self.web_api_email = self.get_setting("web_api_email", self.web_api_email)
+		self.web_api_inventory_id = self.get_setting("web_api_inventory_id", self.web_api_inventory_id)
+		try:
+			self.web_api_password = self.get_notification_secret("web_api_password") or self.web_api_password
+		except Exception:
+			pass
+		self.web_api_token = ""
+		self.web_api_sync_running = False
+		self.web_api_cycle_running = False
+		self.web_api_poll_started = False
+		self.web_api_pending_changes: dict[str, dict] = {}
+		self.web_api_pending_lock = threading.Lock()
 		self.build_interface()
 		self.refresh_items()
 		self.update_admin_controls()
 		self.root.protocol("WM_DELETE_WINDOW", self.close)
 		self.root.after(1_000, self.poll_google_sheet)
-		self.root.after(1_500, self.sync_to_google_sheets)
+		if self.web_api_base_url:
+			self.root.after(1_500, self.sync_to_web_service)
+			self.root.after(3_000, self.poll_web_service)
+			self.web_api_poll_started = True
+		else:
+			self.root.after(1_500, self.sync_to_google_sheets)
 		self.root.after(30_000, self.expire_due_checkouts)
 		# Allow scanner bursts to be recognized from any field.  Entry widgets get
 		# a first-in-line binding so their existing text can be restored after a
@@ -643,6 +745,266 @@ class CheckInSystem:
 					"Bell schedule import failed", str(error), parent=self.root
 				))
 
+	def web_api_request(self, method: str, path: str, payload: dict | None = None, headers: dict | None = None) -> tuple[int, dict | None]:
+		"""Send a request to the hosted inventory API and return the HTTP status and JSON payload, or a detail string."""
+		if not self.web_api_base_url:
+			return 0, None
+		request_headers = {"Accept": "application/json"}
+		if headers:
+			request_headers.update(headers)
+		if payload is not None:
+			request_headers["Content-Type"] = "application/json"
+		body = json.dumps(payload).encode("utf-8") if payload is not None else None
+		request = Request(f"{self.web_api_base_url.rstrip('/')}{path}", data=body, headers=request_headers, method=method)
+		try:
+			with urlopen(request, timeout=30) as response:
+				text = response.read().decode("utf-8")
+				return response.status, json.loads(text) if text else None
+		except Exception as error:
+			if hasattr(error, "read"):
+				try:
+					text = error.read().decode("utf-8")
+					try:
+						details = json.loads(text) if text else {}
+					except json.JSONDecodeError:
+						details = {"detail": text}
+				except Exception:
+					details = {"detail": str(error)}
+				status_code = getattr(error, "code", 500)
+				return status_code, details
+			return getattr(error, "code", 500), {"detail": str(error)}
+
+	def ensure_web_api_session(self) -> bool:
+		"""Authenticate against the hosted API and capture a token and inventory ID for this desktop app."""
+		if not self.web_api_base_url:
+			return False
+		if self.web_api_token and self.web_api_inventory_id:
+			return True
+		if not self.web_api_email or not self.web_api_password:
+			return False
+		status_code, payload = self.web_api_request(
+			"POST",
+			"/api/auth/login",
+			{"email": self.web_api_email, "password": self.web_api_password},
+		)
+		if status_code != 200 or payload is None:
+			return False
+		self.web_api_token = payload.get("token", "")
+		inventories = payload.get("inventories", [])
+		if self.web_api_inventory_id:
+			inventory_id = str(self.web_api_inventory_id)
+			self.web_api_inventory_id = inventory_id
+			return bool(self.web_api_token)
+		if inventories:
+			self.web_api_inventory_id = str(inventories[0]["id"])
+		return bool(self.web_api_token and self.web_api_inventory_id)
+
+	def sync_to_web_service(self, show_result: bool = True) -> None:
+		"""Upload the desktop database to the hosted inventory API once when the app first connects to a remote service."""
+		if not self.web_api_base_url or self.web_api_sync_running:
+			return
+		self.web_api_sync_running = True
+		try:
+			if not self.ensure_web_api_session():
+				if show_result:
+					self.root.after(0, lambda: messagebox.showwarning(
+						"Web service not configured",
+						"Set --api-url, --api-email, and --api-password to sync this app to the hosted inventory API.",
+						parent=self.root,
+					))
+				self.web_api_sync_running = False
+				return
+			payload = build_web_service_import_payload(DATABASE_FILE)
+			if not any(payload.values()):
+				self.web_api_sync_running = False
+				return
+			status_code, response = self.web_api_request(
+				"POST",
+				"/api/import/sqlite",
+				payload,
+				headers={
+					"Authorization": f"Bearer {self.web_api_token}",
+					"X-Inventory-ID": str(self.web_api_inventory_id),
+				},
+			)
+			if status_code == 200:
+				if show_result:
+					self.root.after(0, lambda: messagebox.showinfo(
+						"Web service", "Inventory synced to the hosted inventory service.", parent=self.root
+					))
+			elif status_code == 409:
+				borrower_status, borrower_response = self.web_api_request(
+					"PUT",
+					"/api/borrowers/sync",
+					{"borrowers": payload["borrowers"]},
+					headers={
+						"Authorization": f"Bearer {self.web_api_token}",
+						"X-Inventory-ID": str(self.web_api_inventory_id),
+					},
+				)
+				if borrower_status == 200 and show_result:
+					self.root.after(0, lambda: messagebox.showinfo(
+						"Web service", "Borrower accounts synced to the hosted inventory service.", parent=self.root
+					))
+				elif show_result:
+					detail = borrower_response.get("detail") if isinstance(borrower_response, dict) else str(borrower_response)
+					self.root.after(0, lambda: messagebox.showwarning(
+						"Borrower sync skipped", detail or f"Hosted service rejected borrower sync (HTTP {borrower_status}).",
+						parent=self.root,
+					))
+			elif show_result:
+				detail = response.get("detail") if isinstance(response, dict) else str(response)
+				self.root.after(0, lambda: messagebox.showwarning(
+					"Web inventory sync skipped",
+					detail or f"Hosted inventory rejected the desktop sync (HTTP {status_code}).",
+					parent=self.root,
+				))
+			self.web_api_sync_running = False
+		except Exception as error:
+			self.web_api_sync_running = False
+			if show_result:
+				self.root.after(0, lambda: messagebox.showerror(
+					"Web inventory sync failed",
+					str(error), parent=self.root,
+				))
+
+	def queue_web_service_checkout_sync(self, barcode: str) -> None:
+		"""Queue one locally committed checkout change for the hosted inventory."""
+		if not self.web_api_base_url or not barcode:
+			return
+		with self.db_lock:
+			row = self.database.execute(
+				"SELECT checked_out_by, checked_out_at, checkout_due_at FROM items WHERE barcode = ?",
+				(barcode,),
+			).fetchone()
+		if row is None:
+			return
+		with self.web_api_pending_lock:
+			self.web_api_pending_changes[barcode] = {
+				"checked_out_by": row["checked_out_by"],
+				"checked_out_at": row["checked_out_at"],
+				"checkout_due_at": row["checkout_due_at"],
+			}
+		self.start_web_service_sync_cycle()
+
+	def start_web_service_sync_cycle(self) -> None:
+		"""Run one serialized web push/pull cycle without blocking the Tk event loop."""
+		if not self.web_api_base_url or self.web_api_cycle_running:
+			return
+		self.web_api_cycle_running = True
+		self.web_api_executor.submit(self.run_web_service_sync_cycle)
+
+	def poll_web_service(self) -> None:
+		"""Refresh hosted checkout changes periodically while the desktop app is open."""
+		self.start_web_service_sync_cycle()
+		self.root.after(WEB_API_SYNC_INTERVAL_MS, self.poll_web_service)
+
+	def authenticated_web_api_request(
+		self, method: str, path: str, payload: dict | None = None,
+	) -> tuple[int, dict | list | None]:
+		if not self.ensure_web_api_session():
+			return 401, None
+		headers = {
+			"Authorization": f"Bearer {self.web_api_token}",
+			"X-Inventory-ID": str(self.web_api_inventory_id),
+		}
+		status_code, response = self.web_api_request(method, path, payload, headers)
+		if status_code == 401:
+			self.web_api_token = ""
+			if self.ensure_web_api_session():
+				headers["Authorization"] = f"Bearer {self.web_api_token}"
+				status_code, response = self.web_api_request(method, path, payload, headers)
+		return status_code, response
+
+	def run_web_service_sync_cycle(self) -> None:
+		"""Push pending local changes, then apply the latest hosted checkout state."""
+		conflicted_barcodes: set[str] = set()
+		try:
+			if not self.ensure_web_api_session():
+				return
+			with self.web_api_pending_lock:
+				pending = list(self.web_api_pending_changes.items())
+			for barcode, change in pending:
+				borrower = change["checked_out_by"]
+				if borrower:
+					status_code, _response = self.authenticated_web_api_request(
+						"POST", f"/api/items/{quote(barcode, safe='')}/checkout",
+						{"borrower": borrower, "due_at": change["checkout_due_at"]},
+					)
+				else:
+					status_code, _response = self.authenticated_web_api_request(
+						"POST", f"/api/items/{quote(barcode, safe='')}/checkin",
+					)
+				if status_code == 200 or (status_code == 409 and not borrower):
+					with self.web_api_pending_lock:
+						if self.web_api_pending_changes.get(barcode) == change:
+							self.web_api_pending_changes.pop(barcode, None)
+				elif status_code == 409:
+					with self.web_api_pending_lock:
+						if self.web_api_pending_changes.get(barcode) == change:
+							self.web_api_pending_changes.pop(barcode, None)
+					conflicted_barcodes.add(barcode)
+				elif status_code == 401:
+					return
+
+			status_code, remote_items = self.authenticated_web_api_request("GET", "/api/items")
+			if status_code == 200 and isinstance(remote_items, list):
+				self.root.after(0, self.apply_web_service_item_snapshot, remote_items, conflicted_barcodes)
+		except Exception:
+			logging.exception("Web service checkout sync failed")
+		finally:
+			self.web_api_cycle_running = False
+
+	def apply_web_service_item_snapshot(
+		self, remote_items: list[dict], conflicted_barcodes: set[str] | None = None,
+	) -> None:
+		"""Apply hosted checkout fields without overwriting local item metadata."""
+		conflicted_barcodes = conflicted_barcodes or set()
+		changed = False
+		with self.db_lock:
+			for remote in remote_items:
+				barcode = str(remote.get("barcode", ""))
+				if not barcode:
+					continue
+				if barcode in conflicted_barcodes:
+					self.recently_changed_barcodes.pop(barcode, None)
+				with self.web_api_pending_lock:
+					if barcode in self.web_api_pending_changes:
+						continue
+				local = self.database.execute(
+					"SELECT name, checked_out_by, checked_out_at, checkout_due_at, checkout_late "
+					"FROM items WHERE barcode = ?", (barcode,),
+				).fetchone()
+				if local is None:
+					continue
+				borrower = remote.get("checked_out_by") or None
+				checked_out_at = remote.get("checked_out_at") if borrower else None
+				due_at = remote.get("checkout_due_at") if borrower else None
+				is_late = int(remote.get("status") == "Late")
+				if (local["checked_out_by"], local["checked_out_at"], local["checkout_due_at"], int(local["checkout_late"])) == (borrower, checked_out_at, due_at, is_late):
+					continue
+				if local["checked_out_by"] != borrower:
+					if local["checked_out_by"]:
+						self.record_history(barcode, local["name"], "Checked in", local["checked_out_by"])
+						if not borrower:
+							self.database.execute(
+								"DELETE FROM reservations WHERE barcode = ? AND reserved_date <= ?",
+								(barcode, datetime.now().strftime("%Y-%m-%d")),
+							)
+					if borrower:
+						self.record_history(barcode, local["name"], "Checked out", borrower)
+				self.database.execute(
+					"UPDATE items SET checked_out_by = ?, checked_out_at = ?, checkout_due_at = ?, checkout_late = ? "
+					"WHERE barcode = ?",
+					(borrower, checked_out_at, due_at, is_late, barcode),
+				)
+				self.mark_recently_changed(barcode)
+				changed = True
+			if changed:
+				self.database.commit()
+		if changed:
+			self.refresh_items()
+
 	def sync_to_google_sheets(self, show_result: bool = True) -> None:
 		"""Public entry point: export local data to Sheets on the background executor, skipping if one is already running."""
 		if not GOOGLE_SHEETS_ENABLED or not GOOGLE_SPREADSHEET_ID or self.google_sync_running:
@@ -664,11 +1026,12 @@ class CheckInSystem:
 			worksheet = self.get_google_worksheet(GOOGLE_WORKSHEET_NAME)
 
 			rows = self.database.execute(
-				"SELECT items.barcode, items.name, items.category, items.unavailable, "
+				"SELECT items.barcode, items.name, items.category, items.unavailable, items.missing, "
 				"items.checked_out_by, items.checked_out_at, items.checkout_due_at, items.checkout_late FROM items "
 				"LEFT JOIN categories ON categories.name = items.category COLLATE NOCASE "
 				"ORDER BY COALESCE(categories.sort_order, 999999), COALESCE(items.category, '') COLLATE NOCASE, "
 				"CASE "
+				"WHEN items.missing = 1 THEN 3 "
 				"WHEN items.unavailable = 1 THEN 2 "
 				"WHEN items.checked_out_by IS NOT NULL THEN 1 "
 				"ELSE 0 END, items.name COLLATE NOCASE"
@@ -676,7 +1039,9 @@ class CheckInSystem:
 			values = [["Barcode", "Item", "Category", "Status", "Checked out by", "Checkout time", "Checkout due"]]
 			for row in rows:
 				today_reservation = self.get_reservation(row["barcode"])
-				if row["unavailable"]:
+				if row["missing"]:
+					status = "Missing"
+				elif row["unavailable"]:
 					status = "Unavailable"
 				elif row["checked_out_by"]:
 					status = "Late" if row["checkout_late"] else "Checked out"
@@ -695,7 +1060,7 @@ class CheckInSystem:
 				worksheet.add_validation(
 					"D2:D1000",
 					ValidationConditionType.one_of_list,
-					["Available", "Unavailable", "Reserved", "Late"],
+					["Available", "Unavailable", "Reserved", "Late", "Missing"],
 					strict=True,
 					showCustomUi=True,
 				)
@@ -882,10 +1247,12 @@ class CheckInSystem:
 							continue
 						borrower = accounts[0]["full_name"]
 					item = self.database.execute(
-						"SELECT name, unavailable, checked_out_by FROM items WHERE barcode = ?", (barcode,)
+						"SELECT name, unavailable, missing, checked_out_by FROM items WHERE barcode = ?", (barcode,)
 					).fetchone()
 					if item is None:
 						skipped_items.append(f"{barcode} (not found)")
+					elif item["missing"] and borrower and not item["checked_out_by"]:
+						skipped_items.append(f"{barcode} (marked missing; scan it before checkout)")
 					elif item["checked_out_by"] is None and borrower and self.database.execute(
 						"SELECT 1 FROM reservations WHERE barcode = ? AND reserved_date <= ?",
 						(barcode, datetime.now().strftime("%Y-%m-%d")),
@@ -897,12 +1264,14 @@ class CheckInSystem:
 							"WHERE barcode = ?",
 							(barcode,),
 						)
-						self.record_history(barcode, item["name"], "Checked in", None)
+						self.record_history(barcode, item["name"], "Checked in", item["checked_out_by"])
 						checked_in_count += 1
 						changed = True
 					elif item["unavailable"]:
 						if status == "available":
-							self.database.execute("UPDATE items SET unavailable = 0 WHERE barcode = ?", (barcode,))
+							self.database.execute(
+								"UPDATE items SET unavailable = 0, missing = 0 WHERE barcode = ?", (barcode,)
+							)
 							availability_count += 1
 							changed = True
 						elif borrower:
@@ -911,7 +1280,9 @@ class CheckInSystem:
 						if item["checked_out_by"]:
 							skipped_items.append(f"{barcode} (checked out)")
 						else:
-							self.database.execute("UPDATE items SET unavailable = 1 WHERE barcode = ?", (barcode,))
+							self.database.execute(
+								"UPDATE items SET unavailable = 1, missing = 0 WHERE barcode = ?", (barcode,)
+							)
 							availability_count += 1
 							changed = True
 					elif item["checked_out_by"] and not self.names_match(item["checked_out_by"], borrower):
@@ -1221,9 +1592,13 @@ class CheckInSystem:
 				student_id TEXT NOT NULL UNIQUE,
 				email TEXT NOT NULL,
 				phone TEXT NOT NULL,
+				sms_opt_in INTEGER NOT NULL DEFAULT 0,
 				created_at TEXT NOT NULL
 			)"""
 		)
+		account_columns = {column[1] for column in self.database.execute("PRAGMA table_info(accounts)")}
+		if "sms_opt_in" not in account_columns:
+			self.database.execute("ALTER TABLE accounts ADD COLUMN sms_opt_in INTEGER NOT NULL DEFAULT 0")
 		self.database.execute(
 			"""CREATE TABLE IF NOT EXISTS checkout_history (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1256,6 +1631,8 @@ class CheckInSystem:
 			self.database.execute("ALTER TABLE items ADD COLUMN photo_path TEXT")
 		if "unavailable" not in columns:
 			self.database.execute("ALTER TABLE items ADD COLUMN unavailable INTEGER NOT NULL DEFAULT 0")
+		if "missing" not in columns:
+			self.database.execute("ALTER TABLE items ADD COLUMN missing INTEGER NOT NULL DEFAULT 0")
 		if "category" not in columns:
 			self.database.execute("ALTER TABLE items ADD COLUMN category TEXT")
 		if "checkout_due_at" not in columns:
@@ -1349,23 +1726,64 @@ class CheckInSystem:
 			return row["checked_out_at"]
 		return f"{row['checked_out_at']} – {row['checkout_due_at']}"
 
-	def send_checkout_expiry_email(self, recipient: str, subject: str, body: str) -> bool:
-		"""Placeholder for an email provider; return True after a real provider sends successfully."""
-		if not CHECKOUT_EXPIRY_NOTIFICATIONS_ENABLED or not recipient:
+	def send_checkout_expiry_email(
+		self, recipient: str, subject: str, body: str, settings: dict[str, str]
+	) -> bool:
+		"""Send an overdue notice through the configured SMTP account."""
+		if settings.get("checkout_email_enabled") != "1" or not recipient:
 			return False
-		# TODO: Connect an email provider here, then return whether delivery succeeded.
-		return False
+		password = self.get_notification_secret("smtp_password")
+		if not password:
+			raise RuntimeError("SMTP password is missing from Keychain")
+		message = EmailMessage()
+		message["Subject"] = subject
+		message["From"] = settings["smtp_from_email"]
+		message["To"] = recipient
+		message.set_content(body)
+		with smtplib.SMTP_SSL(
+			settings["smtp_host"],
+			int(settings["smtp_port"]),
+			timeout=15,
+		) as server:
+			server.login(settings["smtp_username"], password)
+			refused = server.send_message(message)
+			if recipient in refused:
+				raise RuntimeError(f"SMTP refused recipient {recipient}: {refused[recipient]}")
+		return True
 
-	def send_checkout_expiry_message(self, recipient: str, body: str) -> bool:
-		"""Placeholder for an SMS/text provider; return True after a real provider sends successfully."""
-		if not CHECKOUT_EXPIRY_NOTIFICATIONS_ENABLED or not recipient:
+	def send_checkout_expiry_message(self, recipient: str, body: str, settings: dict[str, str]) -> bool:
+		"""Send an overdue SMS through the configured Twilio account."""
+		if settings.get("checkout_sms_enabled") != "1" or not recipient:
 			return False
-		# TODO: Connect an SMS/text provider here, then return whether delivery succeeded.
-		return False
+		account_sid = settings.get("twilio_account_sid", "")
+		auth_token = self.get_notification_secret("twilio_auth_token")
+		if not account_sid or not auth_token:
+			raise RuntimeError("Twilio credentials are missing")
+		endpoint = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+		request = Request(
+			endpoint,
+			data=urlencode({
+				"To": recipient,
+				"From": settings.get("twilio_from_number", ""),
+				"Body": body,
+			}).encode("utf-8"),
+			method="POST",
+			headers={
+				"Authorization": "Basic " + base64.b64encode(
+					f"{account_sid}:{auth_token}".encode("utf-8")
+				).decode("ascii"),
+				"Content-Type": "application/x-www-form-urlencoded",
+			},
+		)
+		with urlopen(request, timeout=15) as response:
+			if response.status not in (200, 201):
+				raise RuntimeError(f"Twilio returned HTTP {response.status}")
+		return True
 
 	def notify_checkout_expired(
-		self, borrower: str, item_name: str, due_at: str, email: str | None, phone: str | None
-	) -> None:
+		self, borrower: str, item_name: str, due_at: str, email: str | None, phone: str | None,
+		sms_opt_in: bool, settings: dict[str, str],
+	) -> list[str]:
 		"""Send the overdue checkout notice through the configured email/message hooks."""
 		due_display = due_at
 		try:
@@ -1379,8 +1797,19 @@ class CheckInSystem:
 			"The item has been marked late because it was not returned by the end of the class period.\n\n"
 			"Please contact the equipment desk if you still have the item."
 		)
-		self.send_checkout_expiry_email(email or "", subject, body)
-		self.send_checkout_expiry_message(phone or "", body)
+		sms_body = body + "\n\nReply STOP to opt out of text reminders."
+		failures = []
+		if settings.get("checkout_email_enabled") == "1" and email:
+			try:
+				self.send_checkout_expiry_email(email, subject, body, settings)
+			except Exception as error:
+				failures.append(f"email to {email}: {error}")
+		if settings.get("checkout_sms_enabled") == "1" and sms_opt_in and phone:
+			try:
+				self.send_checkout_expiry_message(phone, sms_body, settings)
+			except Exception as error:
+				failures.append(f"SMS to {phone}: {error}")
+		return failures
 
 	def expire_due_checkouts(self) -> None:
 		"""Mark overdue items late and notify borrowers, then schedule the next check."""
@@ -1388,6 +1817,8 @@ class CheckInSystem:
 			return
 		self.expiration_check_running = True
 		changed = False
+		notifications = []
+		notification_settings = self.get_checkout_notification_settings()
 		now = datetime.now()
 		now_text = now.strftime("%Y-%m-%d %H:%M")
 		try:
@@ -1400,15 +1831,18 @@ class CheckInSystem:
 					(now_text,),
 				).fetchall()
 				for row in rows:
-					account = self.database.execute(
-						"SELECT email, phone FROM accounts WHERE full_name = ? COLLATE NOCASE LIMIT 1",
+					accounts = self.database.execute(
+						"SELECT email, phone, sms_opt_in FROM accounts WHERE full_name = ? COLLATE NOCASE",
 						(row["checked_out_by"],),
-					).fetchone()
-					self.notify_checkout_expired(
+					).fetchall()
+					account = accounts[0] if len(accounts) == 1 else None
+					notifications.append((
 						row["checked_out_by"], row["name"], row["checkout_due_at"],
 						account["email"] if account else None,
 						account["phone"] if account else None,
-					)
+						bool(account["sms_opt_in"]) if account else False,
+						notification_settings,
+					))
 					self.database.execute(
 						"UPDATE items SET checkout_late = 1 "
 						"WHERE barcode = ? AND checked_out_by IS NOT NULL AND checkout_late = 0",
@@ -1419,6 +1853,9 @@ class CheckInSystem:
 					changed = True
 				if changed:
 					self.database.commit()
+			for notification in notifications:
+				future = self.notification_executor.submit(self.notify_checkout_expired, *notification)
+				future.add_done_callback(self.notification_delivery_finished)
 			if changed:
 				self.refresh_items()
 				self.sync_to_google_sheets(show_result=False)
@@ -1426,18 +1863,40 @@ class CheckInSystem:
 			self.expiration_check_running = False
 			self.root.after(30_000, self.expire_due_checkouts)
 
-	def choose_schedule_dates(self, parent: tk.Misc) -> set[str] | None:
-		"""Let an admin select one or more dates from a calendar."""
+	def notification_delivery_finished(self, future) -> None:
+		"""Report provider failures on the Tk thread after asynchronous delivery."""
+		try:
+			failures = future.result()
+		except Exception as error:
+			failures = [str(error)]
+		if not failures:
+			return
+		message = "Late-item notice delivery failed: " + "; ".join(failures)
+		logging.error(message)
+		try:
+			self.root.after(0, lambda: self.set_action_feedback(message, "error"))
+		except tk.TclError:
+			pass
+
+	def choose_schedule_dates(
+		self,
+		parent: tk.Misc,
+		title: str = "Choose schedule dates",
+		instruction: str = "Click dates to select them. Select several dates for the same schedule.",
+		continuous_from_today: bool = False,
+	) -> set[str] | None:
+		"""Let the user select one or more dates from a calendar."""
 		dialog = tk.Toplevel(parent)
-		dialog.title("Choose schedule dates")
+		dialog.title(title)
 		dialog.resizable(True, False)
 		dialog.transient(parent)
 		dialog.grab_set()
 		frame = ttk.Frame(dialog, padding=14)
 		frame.grid()
 		today = datetime.now()
+		today_text = today.strftime("%Y-%m-%d")
 		month_year = [today.year, today.month]
-		selected_dates = {today.strftime("%Y-%m-%d")}
+		selected_dates = {today_text}
 		month_label = tk.StringVar()
 		selection_label = tk.StringVar()
 		calendar_frame = ttk.Frame(frame)
@@ -1459,19 +1918,31 @@ class CheckInSystem:
 						continue
 					date_text = f"{year:04d}-{month:02d}-{day:02d}"
 					is_selected = date_text in selected_dates
+					is_before_today = continuous_from_today and date_text < today_text
 					date_cell = tk.Label(
 						calendar_frame, text=str(day), width=4, height=2,
-						bg="#5b9bf7" if is_selected else "#ffffff",
-						fg="#000000", relief="solid" if is_selected else "flat", borderwidth=1,
+						bg="#5b9bf7" if is_selected else "#eeeeee" if is_before_today else "#ffffff",
+						fg="#888888" if is_before_today else "#000000",
+						relief="solid" if is_selected else "flat", borderwidth=1,
 					)
 					date_cell.grid(row=row_number, column=column, padx=2, pady=2)
-					date_cell.bind(
-						"<Button-1>",
-						lambda _event, value=date_text: toggle_date(value),
-					)
+					if not is_before_today:
+						date_cell.bind(
+							"<Button-1>",
+							lambda _event, value=date_text: toggle_date(value),
+						)
 			selection_label.set(f"{len(selected_dates)} date(s) selected")
 
 		def toggle_date(date_text: str) -> None:
+			if continuous_from_today:
+				selected_dates.clear()
+				current_date = today
+				end_date = datetime.strptime(date_text, "%Y-%m-%d")
+				while current_date.date() <= end_date.date():
+					selected_dates.add(current_date.strftime("%Y-%m-%d"))
+					current_date += timedelta(days=1)
+				render_calendar()
+				return
 			if date_text in selected_dates and len(selected_dates) > 1:
 				selected_dates.remove(date_text)
 			else:
@@ -1489,10 +1960,9 @@ class CheckInSystem:
 		tk.Button(frame, text="<", command=lambda: change_month(-1)).grid(row=0, column=0)
 		ttk.Label(frame, textvariable=month_label, width=22, anchor="center").grid(row=0, column=1)
 		tk.Button(frame, text=">", command=lambda: change_month(1)).grid(row=0, column=2)
-		tk.Label(
-			frame, text="Click dates to select them. Select several dates for the same schedule.",
-			foreground="#555555",
-		).grid(row=2, column=0, columnspan=3, pady=(8, 2))
+		tk.Label(frame, text=instruction, foreground="#555555", wraplength=320).grid(
+			row=2, column=0, columnspan=3, pady=(8, 2)
+		)
 		tk.Label(frame, textvariable=selection_label, foreground="#555555").grid(
 			row=3, column=0, columnspan=3
 		)
@@ -1990,12 +2460,25 @@ class CheckInSystem:
 			(barcode, reserved_date),
 		).fetchone()
 
-	def booking_request_is_recent(self, created_at: str) -> bool:
-		"""Return whether a pending booking can still be deleted without admin access."""
+	def get_booking_dates(self, barcode: str, borrower: str, created_at: str) -> set[str]:
+		"""Return the dates for one calendar booking selection for this item and borrower."""
+		rows = self.database.execute(
+			"SELECT reserved_date, borrower FROM reservations "
+			"WHERE barcode = ? AND created_at = ? AND status = 'Confirmed'",
+			(barcode, created_at),
+		).fetchall()
+		return {
+			row["reserved_date"]
+			for row in rows
+			if self.names_match(row["borrower"], borrower)
+		}
+
+	def booking_is_recent(self, created_at: str) -> bool:
+		"""Return whether a recent booking can still be deleted without admin access."""
 		for format_text in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
 			try:
 				created_time = datetime.strptime(created_at, format_text)
-				return (datetime.now() - created_time).total_seconds() <= BOOKING_REQUEST_DELETE_GRACE_SECONDS
+				return (datetime.now() - created_time).total_seconds() <= BOOKING_DELETE_GRACE_SECONDS
 			except ValueError:
 				continue
 		return False
@@ -2056,15 +2539,13 @@ class CheckInSystem:
 			self.admin_status.set("Admin mode" if self.admin_mode else "Normal mode")
 		if hasattr(self, "admin_button"):
 			self.admin_button.configure(text="Leave Admin Mode" if self.admin_mode else "Enter Admin Mode")
-		if hasattr(self, "tips_and_rules_text"):
-			self.tips_and_rules_text.configure(state="normal" if self.admin_mode else "disabled")
 
 		admin_only_buttons = []
 		for attr_name in (
 			"add_button", "edit_button", "photo_button",
 			"unavailable_button", "delete_button", "history_button",
 			"category_button", "export_button", "manage_accounts_button",
-			"bell_schedule_button",
+			"bell_schedule_button", "notification_settings_button", "web_api_settings_button",
 		):
 			button = getattr(self, attr_name, None)
 			if button is not None:
@@ -2080,7 +2561,7 @@ class CheckInSystem:
 				"add_button", "edit_button", "photo_button",
 				"unavailable_button", "delete_button", "history_button",
 				"category_button", "export_button", "manage_accounts_button",
-				"bell_schedule_button",
+				"bell_schedule_button", "notification_settings_button", "web_api_settings_button",
 			):
 				button = getattr(self, attr_name, None)
 				if button is not None:
@@ -2088,21 +2569,325 @@ class CheckInSystem:
 			for attr_name in ("edit_button", "photo_button", "unavailable_button", "delete_button"):
 				button = getattr(self, attr_name, None)
 				if button is not None:
-					button.state(["!disabled"] if self.selected_barcode else ["disabled"])
+					button.state(["!disabled"] if len(self.multi_scan_queue) == 1 else ["disabled"])
+		checked_out_selection = any(
+			self.database.execute(
+				"SELECT 1 FROM items WHERE barcode = ? AND checked_out_by IS NOT NULL",
+				(barcode,),
+			).fetchone()
+			for barcode in self.multi_scan_queue
+		)
 		if hasattr(self, "checkout_button"):
-			self.checkout_button.configure(state="normal" if self.selected_barcode else "disabled")
+			if checked_out_selection:
+				self.checkout_button.grid_remove()
+			else:
+				self.checkout_button.grid()
+				self.checkout_button.configure(state="normal")
 		if hasattr(self, "checkin_button"):
-			self.checkin_button.configure(state="normal" if self.selected_barcode else "disabled")
+			if checked_out_selection:
+				self.checkin_button.grid()
+			else:
+				self.checkin_button.grid_remove()
 		if hasattr(self, "book_button"):
-			self.book_button.state(["!disabled"] if self.selected_barcode else ["disabled"])
+			self.book_button.state(["!disabled"] if self.multi_scan_queue else ["disabled"])
 		if self.selected_barcode and hasattr(self, "unavailable_button"):
 			row = self.database.execute(
 				"SELECT unavailable FROM items WHERE barcode = ?", (self.selected_barcode,)
 			).fetchone()
 			self.unavailable_button.configure(text="Mark Available" if row and row["unavailable"] else "Mark Unavailable")
+		if hasattr(self, "selection_status"):
+			count = len(self.multi_scan_queue)
+			self.selection_status.set(f"{count} selected" if count else "No items selected")
+
+	def get_notification_secret(self, key: str) -> str | None:
+		"""Read a provider secret from the macOS Keychain via keyring."""
+		import keyring
+		return keyring.get_password(NOTIFICATION_KEYRING_SERVICE, key)
+
+	def set_notification_secret(self, key: str, value: str) -> None:
+		"""Store a provider secret in the macOS Keychain via keyring."""
+		import keyring
+		keyring.set_password(NOTIFICATION_KEYRING_SERVICE, key, value)
+
+	def web_api_settings_dialog(self) -> None:
+		"""Configure and verify the hosted inventory API from admin mode."""
+		if not self.admin_mode:
+			return
+		dialog = tk.Toplevel(self.root)
+		dialog.title("Web inventory sync")
+		dialog.transient(self.root)
+		dialog.grab_set()
+		frame = ttk.Frame(dialog, padding=16)
+		frame.grid(sticky="nsew")
+		frame.columnconfigure(1, weight=1)
+		url = tk.StringVar(value=self.web_api_base_url)
+		email = tk.StringVar(value=self.web_api_email)
+		workspace = tk.StringVar()
+		status = tk.StringVar(value="Test the connection before saving.")
+		workspaces: dict[str, str] = {}
+		tested: dict[str, object] = {}
+		password_entry = ttk.Entry(frame, show="*", width=42)
+		password_entry.insert(0, self.web_api_password)
+		workspace_picker = ttk.Combobox(frame, textvariable=workspace, state="readonly", width=39)
+		row = 0
+		for label, variable in (("API server URL", url), ("Account email", email)):
+			ttk.Label(frame, text=label + ":").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
+			ttk.Entry(frame, textvariable=variable, width=42).grid(row=row, column=1, sticky="ew", pady=5)
+			row += 1
+		ttk.Label(frame, text="Account password:").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
+		password_entry.grid(row=row, column=1, sticky="ew", pady=5)
+		row += 1
+		ttk.Label(frame, text="Inventory workspace:").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
+		workspace_picker.grid(row=row, column=1, sticky="ew", pady=5)
+		row += 1
+		ttk.Label(frame, textvariable=status, wraplength=440).grid(
+			row=row, column=0, columnspan=2, sticky="w", pady=(8, 10)
+		)
+		row += 1
+		buttons = ttk.Frame(frame)
+		buttons.grid(row=row, column=0, columnspan=2, sticky="ew")
+		test_button = ttk.Button(buttons, text="Test connection")
+		test_button.pack(side="left")
+		save_button = ttk.Button(buttons, text="Save and sync", state="disabled")
+		save_button.pack(side="left", padx=(8, 0))
+		ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
+
+		def show_login_error(message: str) -> None:
+			status.set(f"Connection failed: {message}")
+			test_button.state(["!disabled"])
+
+		def show_login_result(base_url: str, account_email: str, account_password: str, result: dict) -> None:
+			available = result.get("inventories", [])
+			if not available and result.get("inventory_id") is not None:
+				available = [{"id": result["inventory_id"], "name": "Inventory", "role": "owner"}]
+			if not available:
+				show_login_error("This account does not have an inventory workspace.")
+				return
+			workspaces.clear()
+			labels = []
+			for inventory in available:
+				label = f"{inventory['name']} (ID {inventory['id']})"
+				workspaces[label] = str(inventory["id"])
+				labels.append(label)
+			workspace_picker.configure(values=labels)
+			workspace.set(next(
+				(label for label in labels if workspaces[label] == str(self.web_api_inventory_id)), labels[0]
+			))
+			tested.clear()
+			tested.update({"url": base_url, "email": account_email, "password": account_password, "result": result})
+			status.set(f"Connected as {result.get('email', account_email)}. Choose the inventory and save.")
+			test_button.state(["!disabled"])
+			save_button.state(["!disabled"])
+
+		def test_connection() -> None:
+			base_url = url.get().strip().rstrip("/")
+			account_email = email.get().strip()
+			account_password = password_entry.get() or self.web_api_password
+			parsed_url = urlsplit(base_url)
+			if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+				messagebox.showwarning("Invalid API URL", "Enter a complete http:// or https:// server URL.", parent=dialog)
+				return
+			if not account_email or not account_password:
+				messagebox.showwarning("Account details required", "Enter the web account email and password.", parent=dialog)
+				return
+			test_button.state(["disabled"])
+			save_button.state(["disabled"])
+			status.set("Connecting and checking available inventories...")
+
+			def request_login() -> None:
+				try:
+					request = Request(
+						f"{base_url}/api/auth/login",
+						data=json.dumps({"email": account_email, "password": account_password}).encode("utf-8"),
+						headers={"Content-Type": "application/json", "Accept": "application/json"},
+						method="POST",
+					)
+					with urlopen(request, timeout=20) as response:
+						result = json.loads(response.read().decode("utf-8"))
+					self.root.after(0, show_login_result, base_url, account_email, account_password, result)
+				except Exception as error:
+					message = str(error)
+					if hasattr(error, "read"):
+						try:
+							details = json.loads(error.read().decode("utf-8"))
+							message = details.get("detail", message)
+						except Exception:
+							pass
+					self.root.after(0, show_login_error, message)
+
+			threading.Thread(target=request_login, daemon=True).start()
+
+		def save_and_sync() -> None:
+			base_url = url.get().strip().rstrip("/")
+			account_email = email.get().strip()
+			account_password = password_entry.get() or self.web_api_password
+			selected_workspace = workspaces.get(workspace.get())
+			if not tested or (tested.get("url"), tested.get("email"), tested.get("password")) != (
+				base_url, account_email, account_password
+			):
+				messagebox.showwarning("Test required", "Test the current server and account before saving.", parent=dialog)
+				return
+			if not selected_workspace:
+				messagebox.showwarning("Choose an inventory", "Select the inventory this app should sync with.", parent=dialog)
+				return
+			try:
+				self.set_notification_secret("web_api_password", account_password)
+			except Exception as error:
+				messagebox.showerror("Keychain unavailable", f"Could not save the API password securely: {error}", parent=dialog)
+				return
+			self.set_setting("web_api_base_url", base_url)
+			self.set_setting("web_api_email", account_email)
+			self.set_setting("web_api_inventory_id", selected_workspace)
+			self.web_api_base_url = base_url
+			self.web_api_email = account_email
+			self.web_api_password = account_password
+			self.web_api_inventory_id = selected_workspace
+			login_result = tested["result"]
+			self.web_api_token = login_result["token"]
+			self.start_web_service_sync_cycle()
+			threading.Thread(target=self.sync_to_web_service, args=(False,), daemon=True).start()
+			if not self.web_api_poll_started:
+				self.web_api_poll_started = True
+				self.root.after(3_000, self.poll_web_service)
+			status.set("Settings saved. The desktop app is syncing with this inventory.")
+			dialog.after(800, dialog.destroy)
+
+		test_button.configure(command=test_connection)
+		save_button.configure(command=save_and_sync)
+		dialog.bind("<Return>", lambda _event: test_connection())
+
+	def get_checkout_notification_settings(self) -> dict[str, str]:
+		"""Read one consistent provider configuration snapshot under the DB lock."""
+		keys = (
+			"checkout_email_enabled", "smtp_host", "smtp_port", "smtp_username", "smtp_from_email",
+			"checkout_sms_enabled", "twilio_account_sid", "twilio_from_number",
+		)
+		with self.db_lock:
+			rows = self.database.execute(
+				"SELECT key, value FROM settings WHERE key IN (" + ",".join("?" for _ in keys) + ")",
+				keys,
+			).fetchall()
+		settings = {row["key"]: row["value"] for row in rows}
+		settings.setdefault("smtp_port", "465")
+		return settings
+
+	def notification_settings_dialog(self) -> None:
+		"""Configure email and Twilio notices; provider secrets are stored in Keychain."""
+		if not self.admin_mode:
+			return
+		dialog = tk.Toplevel(self.root)
+		dialog.title("Overdue notification settings")
+		dialog.transient(self.root)
+		dialog.grab_set()
+		frame = ttk.Frame(dialog, padding=16)
+		frame.grid(sticky="nsew")
+
+		email_enabled = tk.BooleanVar(value=self.get_setting("checkout_email_enabled") == "1")
+		sms_enabled = tk.BooleanVar(value=self.get_setting("checkout_sms_enabled") == "1")
+		settings = {
+			"SMTP host": tk.StringVar(value=self.get_setting("smtp_host", "smtp.gmail.com")),
+			"SMTP port": tk.StringVar(value=self.get_setting("smtp_port", "465")),
+			"SMTP username": tk.StringVar(value=self.get_setting("smtp_username")),
+			"From email": tk.StringVar(value=self.get_setting("smtp_from_email")),
+			"Twilio account SID": tk.StringVar(value=self.get_setting("twilio_account_sid")),
+			"Twilio from number": tk.StringVar(value=self.get_setting("twilio_from_number")),
+		}
+		row = 0
+		ttk.Checkbutton(frame, text="Send overdue email notices", variable=email_enabled).grid(
+			row=row, column=0, columnspan=2, sticky="w", pady=(0, 8)
+		)
+		row += 1
+		for label in ("SMTP host", "SMTP port", "SMTP username", "From email"):
+			ttk.Label(frame, text=label + ":").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=3)
+			ttk.Entry(frame, textvariable=settings[label], width=38).grid(row=row, column=1, sticky="ew", pady=3)
+			row += 1
+		ttk.Label(frame, text="SMTP password:").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=3)
+		ttk.Entry(frame, show="*", width=38).grid(row=row, column=1, sticky="ew", pady=3)
+		smtp_password_entry = frame.grid_slaves(row=row, column=1)[0]
+		row += 1
+		ttk.Label(frame, text="Leave password blank to keep the saved Keychain value.", foreground="#555555").grid(
+			row=row, column=1, sticky="w", pady=(0, 8)
+		)
+		row += 1
+		ttk.Checkbutton(
+			frame,
+			text="Send SMS notices (only to borrowers who opted in)",
+			variable=sms_enabled,
+		).grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 8))
+		row += 1
+		for label in ("Twilio account SID", "Twilio from number"):
+			ttk.Label(frame, text=label + ":").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=3)
+			ttk.Entry(frame, textvariable=settings[label], width=38).grid(row=row, column=1, sticky="ew", pady=3)
+			row += 1
+		ttk.Label(frame, text="Twilio auth token:").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=3)
+		twilio_token_entry = ttk.Entry(frame, show="*", width=38)
+		twilio_token_entry.grid(row=row, column=1, sticky="ew", pady=3)
+		row += 1
+		ttk.Label(frame, text="Leave token blank to keep the saved Keychain value.", foreground="#555555").grid(
+			row=row, column=1, sticky="w", pady=(0, 8)
+		)
+		row += 1
+
+		def save() -> None:
+			try:
+				port = int(settings["SMTP port"].get().strip())
+			except ValueError:
+				messagebox.showwarning("Invalid SMTP port", "Enter an SMTP port from 1 to 65535.", parent=dialog)
+				return
+			if not 1 <= port <= 65535:
+				messagebox.showwarning("Invalid SMTP port", "Enter an SMTP port from 1 to 65535.", parent=dialog)
+				return
+			smtp_password = smtp_password_entry.get().strip()
+			twilio_token = twilio_token_entry.get().strip()
+			try:
+				saved_smtp_password = self.get_notification_secret("smtp_password")
+				saved_twilio_token = self.get_notification_secret("twilio_auth_token")
+				if email_enabled.get() and not (
+					settings["SMTP host"].get().strip()
+					and settings["SMTP username"].get().strip()
+					and settings["From email"].get().strip()
+					and (smtp_password or saved_smtp_password)
+				):
+					messagebox.showwarning(
+						"Email settings incomplete", "Enter SMTP host, username, sender address, and password.", parent=dialog
+					)
+					return
+				if sms_enabled.get() and not (
+					settings["Twilio account SID"].get().strip()
+					and settings["Twilio from number"].get().strip()
+					and (twilio_token or saved_twilio_token)
+				):
+					messagebox.showwarning(
+						"SMS settings incomplete", "Enter the Twilio SID, sending number, and auth token.", parent=dialog
+					)
+					return
+				if smtp_password:
+					self.set_notification_secret("smtp_password", smtp_password)
+				if twilio_token:
+					self.set_notification_secret("twilio_auth_token", twilio_token)
+			except Exception as error:
+				messagebox.showerror("Keychain error", f"Could not access the macOS Keychain: {error}", parent=dialog)
+				return
+			for label, key in (
+				("SMTP host", "smtp_host"),
+				("SMTP username", "smtp_username"),
+				("From email", "smtp_from_email"),
+				("Twilio account SID", "twilio_account_sid"),
+				("Twilio from number", "twilio_from_number"),
+			):
+				self.set_setting(key, settings[label].get().strip())
+			self.set_setting("smtp_port", str(port))
+			self.set_setting("checkout_email_enabled", "1" if email_enabled.get() else "0")
+			self.set_setting("checkout_sms_enabled", "1" if sms_enabled.get() else "0")
+			dialog.destroy()
+			self.set_action_feedback("Overdue notification settings saved.", "success")
+
+		ttk.Button(frame, text="Save settings", command=save).grid(row=row, column=1, sticky="e", pady=(8, 0))
+		dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+
 	def choose_audit_categories(self) -> tuple[bool, set[str] | None]:
 		"""Ask which item categories should be included, or return None for all."""
-		category_names = ["Uncategorized", *self.get_categories()]
+		category_names = self.get_categories()
 		dialog = tk.Toplevel(self.root)
 		dialog.title("Choose audit categories")
 		dialog.resizable(False, False)
@@ -2113,8 +2898,8 @@ class CheckInSystem:
 		tk.Label(frame, text="Choose the categories to include in this audit:").grid(
 			row=0, column=0, sticky="w", pady=(0, 8)
 		)
-		all_categories = tk.BooleanVar(value=True)
-		category_values = {name: tk.BooleanVar(value=True) for name in category_names}
+		all_categories = tk.BooleanVar(value=False)
+		category_values = {name: tk.BooleanVar(value=False) for name in category_names}
 		ttk.Checkbutton(
 			frame, text="All categories", variable=all_categories,
 		).grid(row=1, column=0, sticky="w")
@@ -2183,10 +2968,7 @@ class CheckInSystem:
 			if self.audit_categories is None:
 				self.audit_category_label.set("All categories")
 			else:
-				category_labels = {
-					"Uncategorized": "Uncategorized",
-					**{name.casefold(): name for name in self.get_categories()},
-				}
+				category_labels = {name.casefold(): name for name in self.get_categories()}
 				self.audit_category_label.set(", ".join(
 					category_labels.get(category, category) for category in sorted(self.audit_categories)
 				))
@@ -2206,6 +2988,28 @@ class CheckInSystem:
 		"""Display a summary of the audit results."""
 		scanned_count = len(self.audit_items_scanned)
 		total_expected = self.audit_total_expected
+		scanned_barcodes = set(self.audit_items_scanned)
+		status_changed = False
+		with self.db_lock:
+			audit_rows = self.database.execute(
+				"SELECT barcode, name, category, checked_out_by, unavailable, missing FROM items"
+			).fetchall()
+			for row in audit_rows:
+				if not self.audit_item_is_in_scope(row):
+					continue
+				is_missing = (
+					row["barcode"] not in scanned_barcodes
+					and not row["checked_out_by"]
+					and not row["unavailable"]
+				)
+				if bool(row["missing"]) != is_missing:
+					self.database.execute(
+						"UPDATE items SET missing = ? WHERE barcode = ?",
+						(int(is_missing), row["barcode"]),
+					)
+					status_changed = True
+			if status_changed:
+				self.database.commit()
 		
 		message = (
 			f"Audit Complete!\n\n"
@@ -2219,20 +3023,36 @@ class CheckInSystem:
 			else:
 				# Find missing items
 				missing_items = []
-				cursor = self.database.execute("SELECT barcode, name, category, checked_out_by FROM items")
-				for row in cursor:
+				checked_out_items = []
+				unavailable_items = []
+				for row in audit_rows:
 					if not self.audit_item_is_in_scope(row):
 						continue
 					if row["barcode"] not in self.audit_items_scanned:
-						status = "Checked Out" if row["checked_out_by"] else "Available"
-						borrower = f" ({row['checked_out_by']})" if row["checked_out_by"] else ""
-						missing_items.append(f"- {row['name']} ({row['barcode']}){borrower} [{status}]")
-				
+						if row["checked_out_by"]:
+							checked_out_items.append(
+								f"- {row['name']} ({row['barcode']}) ({row['checked_out_by']})"
+							)
+						elif row["unavailable"]:
+							unavailable_items.append(f"- {row['name']} ({row['barcode']})")
+						else:
+							missing_items.append(f"- {row['name']} ({row['barcode']})")
+
 				if len(missing_items) > 0:
 					message += f"⚠️ Missing {len(missing_items)} items:\n\n"
 					message += "\n".join(missing_items[:20])
 					if len(missing_items) > 20:
 						message += f"\n... and {len(missing_items) - 20} more."
+				if checked_out_items:
+					message += f"\n\nNot scanned (checked out: {len(checked_out_items)}):\n\n"
+					message += "\n".join(checked_out_items[:20])
+					if len(checked_out_items) > 20:
+						message += f"\n... and {len(checked_out_items) - 20} more."
+				if unavailable_items:
+					message += f"\n\nNot scanned (unavailable: {len(unavailable_items)}):\n\n"
+					message += "\n".join(unavailable_items[:20])
+					if len(unavailable_items) > 20:
+						message += f"\n... and {len(unavailable_items) - 20} more."
 				
 				if scanned_count > total_expected:
 					message += f"\n\n❓ Note: You also scanned {scanned_count - total_expected} extra items."
@@ -2240,6 +3060,15 @@ class CheckInSystem:
 			message += "No items were found in the database to audit."
 
 		messagebox.showinfo("Audit Report", message)
+		if status_changed:
+			self.refresh_items()
+			if self.selected_barcode:
+				selected_row = self.database.execute(
+					"SELECT * FROM items WHERE barcode = ?", (self.selected_barcode,)
+				).fetchone()
+				if selected_row:
+					self.show_item(selected_row)
+			self.sync_to_google_sheets(show_result=False)
 		
 		# Automatically end audit mode
 		self.toggle_audit_mode()
@@ -2292,33 +3121,72 @@ class CheckInSystem:
 			return
 		dialog = tk.Toplevel(self.root)
 		dialog.title("Checkout History")
-		dialog.geometry("760x420")
+		dialog.geometry("900x460")
 		dialog.transient(self.root)
 		frame = ttk.Frame(dialog, padding=12)
 		frame.pack(fill="both", expand=True)
+		filter_frame = ttk.Frame(frame)
+		filter_frame.pack(fill="x", pady=(0, 8))
+		filter_frame.columnconfigure(1, weight=1)
+		search_value = tk.StringVar()
+		checked_out_only = tk.BooleanVar(value=False)
+		ttk.Label(filter_frame, text="Search:").grid(row=0, column=0, padx=(0, 8))
+		search_entry = ttk.Entry(filter_frame, textvariable=search_value)
+		search_entry.grid(row=0, column=1, sticky="ew", padx=(0, 12))
 		columns = ("time", "action", "barcode", "item", "borrower")
 		table = ttk.Treeview(frame, columns=columns, show="headings")
+		table.tag_configure("checked_out", background="#ffd9d9", foreground="#9b1c1c")
+		table.tag_configure("checked_in", background="#dff4df", foreground="#176b2c")
+		def refresh_history(*_args) -> None:
+			for row_id in table.get_children():
+				table.delete(row_id)
+			conditions = []
+			parameters = []
+			query = search_value.get().strip()
+			if query:
+				conditions.append(
+					"(timestamp || ' ' || action || ' ' || barcode || ' ' || item_name || ' ' || "
+					"COALESCE(borrower, '')) LIKE ?"
+				)
+				parameters.append(f"%{query}%")
+			if checked_out_only.get():
+				conditions.append(
+					"EXISTS (SELECT 1 FROM items WHERE items.barcode = checkout_history.barcode "
+					"AND items.checked_out_by IS NOT NULL)"
+				)
+			where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+			rows = self.database.execute(
+				"SELECT timestamp, action, barcode, item_name, borrower "
+				"FROM checkout_history" + where_clause + " ORDER BY id DESC",
+				parameters,
+			).fetchall()
+			for row in rows:
+				tag = "checked_out" if row["action"] == "Checked out" else (
+					"checked_in" if row["action"] == "Checked in" else ""
+				)
+				table.insert("", "end", values=(
+					row["timestamp"], row["action"], row["barcode"],
+					row["item_name"], row["borrower"] or "",
+			), tags=(tag,) if tag else ())
+
+		search_value.trace_add("write", refresh_history)
+		ttk.Checkbutton(
+			filter_frame, text="Only items currently checked out", variable=checked_out_only,
+			command=refresh_history,
+		).grid(row=0, column=2, sticky="e")
 		headings = {
 			"time": "Time", "action": "Action", "barcode": "Barcode",
-			"item": "Item", "borrower": "Borrower",
+			"item": "Item", "borrower": "Borrower / returned by",
 		}
-		widths = {"time": 140, "action": 110, "barcode": 140, "item": 190, "borrower": 140}
+		widths = {"time": 140, "action": 110, "barcode": 140, "item": 190, "borrower": 190}
 		for column in columns:
 			table.heading(column, text=headings[column])
 			table.column(column, width=widths[column], anchor="w")
-		rows = self.database.execute(
-			"SELECT timestamp, action, barcode, item_name, borrower "
-			"FROM checkout_history ORDER BY id DESC"
-		).fetchall()
-		for row in rows:
-			table.insert("", "end", values=(
-				row["timestamp"], row["action"], row["barcode"],
-				row["item_name"], row["borrower"] or "",
-			))
 		table.pack(side="left", fill="both", expand=True)
 		scrollbar = ttk.Scrollbar(frame, orient="vertical", command=table.yview)
 		scrollbar.pack(side="right", fill="y")
 		table.configure(yscrollcommand=scrollbar.set)
+		refresh_history()
 
 	def find_accounts(self, name_query: str) -> list[sqlite3.Row]:
 		"""Find accounts by student ID, full name, first name, or last name."""
@@ -2382,13 +3250,53 @@ class CheckInSystem:
 		return result[0]
 
 	def resolve_borrower_account(self, parent: tk.Misc) -> sqlite3.Row | None:
-		"""Resolve the typed borrower to a registered account before checkout."""
-		name_query = self.borrower_name.get().strip()
-		if not name_query:
-			messagebox.showwarning("Name required", "Enter the borrower's first, last, or full name.", parent=parent)
-			self.borrower_entry.focus_set()
+		"""Prompt for and resolve the borrower's account before checkout."""
+		dialog = tk.Toplevel(parent)
+		dialog.title("Check Out")
+		dialog.transient(parent)
+		dialog.grab_set()
+		dialog.resizable(False, False)
+		frame = ttk.Frame(dialog, padding=16)
+		frame.grid(sticky="ew")
+		frame.columnconfigure(0, weight=1)
+		tk.Label(frame, text="Enter your name or student ID:").grid(
+			row=0, column=0, sticky="w", pady=(0, 6)
+		)
+		name_query = tk.StringVar(value=self.borrower_name.get().strip())
+		name_entry = ttk.Entry(frame, textvariable=name_query, width=34)
+		name_entry.grid(row=1, column=0, columnspan=2, sticky="ew")
+		result: list[str | None] = [None]
+
+		def continue_checkout() -> None:
+			value = name_query.get().strip()
+			if not value:
+				messagebox.showwarning("Name required", "Enter your name or student ID.", parent=dialog)
+				name_entry.focus_set()
+				return
+			result[0] = value
+			dialog.destroy()
+
+		def open_signup() -> None:
+			dialog.destroy()
+			self.signup_dialog()
+			self.set_action_feedback("Create your account, then click Check Out again.", "neutral")
+
+		ttk.Button(
+			frame,
+			text="Haven't made an account? Sign Up",
+			command=open_signup,
+		).grid(row=2, column=0, sticky="w", pady=(10, 0))
+		tk.Button(frame, text="Continue", command=continue_checkout).grid(
+			row=2, column=1, sticky="e", padx=(12, 0), pady=(10, 0)
+		)
+		dialog.bind("<Return>", lambda _event: continue_checkout())
+		dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+		name_entry.focus_set()
+		dialog.wait_window()
+		if result[0] is None:
 			return None
-		accounts = self.find_accounts(name_query)
+		name_value = result[0]
+		accounts = self.find_accounts(name_value)
 		if not accounts:
 			messagebox.showwarning(
 				"Account required",
@@ -2411,12 +3319,18 @@ class CheckInSystem:
 		fields = [("Full name", tk.StringVar()), ("Student ID", tk.StringVar()), ("Email", tk.StringVar()), ("Phone", tk.StringVar())]
 		frame = ttk.Frame(dialog, padding=18)
 		frame.grid()
+		sms_opt_in = tk.BooleanVar(value=False)
 		entries = []
 		for row_number, (label, value) in enumerate(fields):
 			ttk.Label(frame, text=f"{label}:").grid(row=row_number, column=0, sticky="w", padx=(0, 10), pady=4)
 			entry = ttk.Entry(frame, textvariable=value, width=34)
 			entry.grid(row=row_number, column=1, pady=4)
 			entries.append(entry)
+		ttk.Checkbutton(
+			frame,
+			text="I agree to one SMS when borrowed equipment becomes overdue. Msg/data rates may apply; reply STOP to opt out.",
+			variable=sms_opt_in,
+		).grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(6, 0))
 
 		def save() -> None:
 			values = [value.get().strip() for _, value in fields]
@@ -2425,8 +3339,9 @@ class CheckInSystem:
 				return
 			try:
 				self.database.execute(
-					"INSERT INTO accounts (full_name, student_id, email, phone, created_at) VALUES (?, ?, ?, ?, ?)",
-					(*values, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+					"INSERT INTO accounts (full_name, student_id, email, phone, sms_opt_in, created_at) "
+					"VALUES (?, ?, ?, ?, ?, ?)",
+					(*values, int(sms_opt_in.get()), datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
 				)
 				self.database.commit()
 			except sqlite3.IntegrityError:
@@ -2435,7 +3350,7 @@ class CheckInSystem:
 			dialog.destroy()
 			messagebox.showinfo("Account created", f"Account created for {values[0]}.", parent=self.root)
 
-		ttk.Button(frame, text="Create account", command=save).grid(row=len(fields), column=1, sticky="e", pady=(12, 0))
+		ttk.Button(frame, text="Create account", command=save).grid(row=len(fields) + 1, column=1, sticky="e", pady=(12, 0))
 		entries[0].focus_set()
 
 	def manage_accounts_dialog(self) -> None:
@@ -2444,15 +3359,15 @@ class CheckInSystem:
 			return
 		dialog = tk.Toplevel(self.root)
 		dialog.title("Manage accounts")
-		dialog.geometry("760x380")
+		dialog.geometry("900x400")
 		dialog.transient(self.root)
 		frame = ttk.Frame(dialog, padding=12)
 		frame.pack(fill="both", expand=True)
-		columns = ("name", "student_id", "email", "phone")
+		columns = ("name", "student_id", "email", "phone", "sms_opt_in")
 		table = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
 		for column, heading, width in (
 			("name", "Name", 180), ("student_id", "Student ID", 120),
-			("email", "Email", 220), ("phone", "Phone", 130),
+			("email", "Email", 220), ("phone", "Phone", 130), ("sms_opt_in", "SMS reminders", 120),
 		):
 			table.heading(column, text=heading)
 			table.column(column, width=width, anchor="w")
@@ -2464,6 +3379,7 @@ class CheckInSystem:
 			for account in self.database.execute("SELECT * FROM accounts ORDER BY full_name COLLATE NOCASE").fetchall():
 				table.insert("", "end", iid=str(account["id"]), values=(
 					account["full_name"], account["student_id"], account["email"], account["phone"],
+					"Yes" if account["sms_opt_in"] else "No",
 				))
 
 		def selected_account() -> sqlite3.Row | None:
@@ -2487,6 +3403,7 @@ class CheckInSystem:
 				("Email", tk.StringVar(value=account["email"])),
 				("Phone", tk.StringVar(value=account["phone"])),
 			]
+			sms_opt_in = tk.BooleanVar(value=bool(account["sms_opt_in"]))
 			edit_frame = ttk.Frame(edit_dialog, padding=16)
 			edit_frame.grid()
 			entries = []
@@ -2495,6 +3412,11 @@ class CheckInSystem:
 				entry = ttk.Entry(edit_frame, textvariable=value, width=34)
 				entry.grid(row=row_number, column=1, pady=4)
 				entries.append(entry)
+			ttk.Checkbutton(
+				edit_frame,
+				text="Borrower agreed to SMS overdue reminders",
+				variable=sms_opt_in,
+			).grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(6, 0))
 
 			def save_changes() -> None:
 				values = [value.get().strip() for _, value in fields]
@@ -2503,8 +3425,9 @@ class CheckInSystem:
 					return
 				try:
 					self.database.execute(
-						"UPDATE accounts SET full_name = ?, student_id = ?, email = ?, phone = ? WHERE id = ?",
-						(*values, account["id"]),
+						"UPDATE accounts SET full_name = ?, student_id = ?, email = ?, phone = ?, "
+						"sms_opt_in = ? WHERE id = ?",
+						(*values, int(sms_opt_in.get()), account["id"]),
 					)
 					self.database.commit()
 				except sqlite3.IntegrityError:
@@ -2514,7 +3437,7 @@ class CheckInSystem:
 				reload_accounts()
 
 			ttk.Button(edit_frame, text="Save changes", command=save_changes).grid(
-				row=len(fields), column=1, sticky="e", pady=(12, 0)
+				row=len(fields) + 1, column=1, sticky="e", pady=(12, 0)
 			)
 			entries[0].focus_set()
 
@@ -2541,11 +3464,11 @@ class CheckInSystem:
 		reload_accounts()
 
 	def build_interface(self) -> None:
-		"""Build every widget in the main window: header/admin controls, scan box, multi-scan queue, item details, and the item list."""
+		"""Build the main window with global actions above a selectable inventory list."""
 		style = ttk.Style(self.root)
 		self.default_bg = style.lookup("TFrame", "background") or self.root.cget("bg")
 		self.root.columnconfigure(0, weight=1)
-		self.root.rowconfigure(2, weight=1)
+		self.root.rowconfigure(4, weight=1)
 
 		header = ttk.Frame(self.root, padding=(20, 18, 20, 8))
 		header.grid(row=0, column=0, sticky="ew")
@@ -2553,7 +3476,7 @@ class CheckInSystem:
 		ttk.Label(header, text="Equipment Check-In System", font=("Segoe UI", 18, "bold")).grid(
 			row=0, column=0, sticky="w"
 		)
-		ttk.Label(header, text="Scan a barcode, then check the item out or back in.").grid(
+		ttk.Label(header, text="Scan an item or select it below, then choose an action.").grid(
 			row=1, column=0, sticky="w", pady=(4, 0)
 		)
 		self.admin_status = tk.StringVar(value="Normal mode")
@@ -2588,61 +3511,13 @@ class CheckInSystem:
 		self.scan_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 		self.scan_entry.bind("<Return>", self.scan_item)
 		ttk.Button(scan_frame, text="Scan / Find", command=self.scan_item).grid(row=0, column=1)
-		ttk.Checkbutton(
-			scan_frame, text="Multi-scan mode (scan several items, then check them out together)",
-			variable=self.multi_scan_enabled, command=self.toggle_multi_scan_mode,
-		).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-		self.multi_scan_frame = ttk.Frame(scan_frame)
-		self.multi_scan_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-		self.multi_scan_frame.columnconfigure(0, weight=1)
-		self.multi_scan_table = ttk.Treeview(
-			self.multi_scan_frame, columns=("barcode", "name", "status"),
-			show="headings", height=5, selectmode="browse",
-		)
-		for column, heading, width in (
-			("barcode", "Barcode", 150), ("name", "Item", 220), ("status", "Status", 110),
-		):
-			self.multi_scan_table.heading(column, text=heading)
-			self.multi_scan_table.column(column, width=width, anchor="w")
-		self.multi_scan_table.grid(row=0, column=0, sticky="nsew")
-		multi_scan_scrollbar = ttk.Scrollbar(
-			self.multi_scan_frame, orient="vertical", command=self.multi_scan_table.yview
-		)
-		multi_scan_scrollbar.grid(row=0, column=1, sticky="ns")
-		self.multi_scan_table.configure(yscrollcommand=multi_scan_scrollbar.set)
-		multi_scan_buttons = ttk.Frame(self.multi_scan_frame)
-		multi_scan_buttons.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
-		self.multi_scan_checkout_button = tk.Button(
-			multi_scan_buttons, text="Check Out All", command=self.checkout_multi_scan_queue,
-			bg="#f4b4b4", fg="#8b0000", activebackground="#e98f8f",
-		)
-		self.multi_scan_checkout_button.grid(row=0, column=0)
-		self.multi_scan_checkin_button = tk.Button(
-			multi_scan_buttons, text="Check In All", command=self.checkin_multi_scan_queue,
-			bg="#c4f0c4", fg="#006400", activebackground="#a0e0a0",
-		)
-		self.multi_scan_checkin_button.grid(row=0, column=1, padx=(8, 0))
-		ttk.Button(
-			multi_scan_buttons, text="Book All", command=self.book_multi_scan_queue,
-		).grid(row=0, column=2, padx=(8, 0))
-		ttk.Button(
-			multi_scan_buttons, text="Remove Selected", command=self.remove_from_multi_scan_queue,
-		).grid(row=0, column=3, padx=(8, 0))
-		ttk.Button(
-			multi_scan_buttons, text="Clear Queue", command=self.clear_multi_scan_queue,
-		).grid(row=0, column=4, padx=(8, 0))
-		self.multi_scan_frame.grid_remove()
-
-		# Audit Mode Frame
 		self.audit_frame = ttk.LabelFrame(self.root, text="Inventory Audit", padding=14)
-		self.audit_frame.grid(row=4, column=0, padx=20, pady=8, sticky="ew")
+		self.audit_frame.grid(row=2, column=0, padx=20, pady=8, sticky="ew")
 		self.audit_frame.columnconfigure(0, weight=1)
-		
 		self.audit_progress = tk.DoubleVar(value=0.0)
 		self.audit_progress_bar = ttk.Progressbar(self.audit_frame, variable=self.audit_progress, maximum=100)
 		self.audit_progress_bar.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-		
 		self.audit_status_label = ttk.Label(self.audit_frame, text="Progress: 0 / 0")
 		self.audit_status_label.grid(row=0, column=1, sticky="w")
 		ttk.Label(self.audit_frame, text="Categories:").grid(row=1, column=0, sticky="w", pady=(8, 0))
@@ -2653,60 +3528,46 @@ class CheckInSystem:
 		ttk.Button(self.audit_frame, text="Show Report & End", command=self.show_audit_report).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 		self.audit_frame.grid_remove()
 
-		details = ttk.LabelFrame(self.root, text="Selected item", padding=14)
-		details.grid(row=2, column=0, padx=20, pady=8, sticky="new")
-		details.columnconfigure(1, weight=1)
-		details.columnconfigure(2, minsize=180)
-		ttk.Label(details, text="Item:").grid(row=0, column=0, sticky="w", padx=(0, 10))
-		ttk.Label(details, textvariable=self.item_name, font=("Segoe UI", 11, "bold")).grid(
-			row=0, column=1, sticky="w"
+		actions = ttk.Frame(self.root, padding=(20, 4, 20, 8))
+		actions.grid(row=3, column=0, sticky="ew")
+		actions.columnconfigure(1, weight=1)
+		tk.Label(actions, text="Select item(s), then check out or book.").grid(
+			row=0, column=0, columnspan=2, sticky="w", padx=(0, 12)
 		)
-		ttk.Label(details, text="Status:").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(8, 0))
-		ttk.Label(details, textvariable=self.item_status).grid(row=1, column=1, sticky="w", pady=(8, 0))
-		ttk.Label(details, text="Category:").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=(8, 0))
-		ttk.Label(details, textvariable=self.item_category).grid(row=2, column=1, sticky="w", pady=(8, 0))
-		tk.Label(details, text="Borrower name or student ID:").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=(8, 0))
-		tk.Label(details, text="Tip: You Can Scan Student ID").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=(8, 0))
-		self.borrower_entry = ttk.Entry(details, textvariable=self.borrower_name)
-		self.borrower_entry.grid(row=3, column=1, sticky="ew", pady=(8, 0))
-		buttons = ttk.Frame(details)
-		buttons.grid(row=4, column=1, sticky="w", pady=(12, 0))
-		self.checkout_button = tk.Button(
-			buttons, text="Check Out", command=self.check_out,
-			bg="#f4b4b4", fg="#8b0000", activebackground="#e98f8f",
+		self.checkout_button = self.create_colored_action_button(
+			actions, "Check Out", self.check_out, "#1f5f8b", "#17496c"
 		)
-		self.checkout_button.grid(row=0, column=0, padx=(0, 8))
-		self.checkin_button = tk.Button(
-			buttons, text="Check In", command=self.check_in,
-			bg="#b8e6b8", fg="#145214", activebackground="#91d391",
+		self.checkout_button.grid(row=0, column=2, padx=(0, 8))
+		self.checkin_button = self.create_colored_action_button(
+			actions, "Check In", self.check_in, "#26734d", "#1d5a3b"
 		)
-		self.checkin_button.grid(row=0, column=1)
-		self.book_button = ttk.Button(buttons, text="Request Booking", command=self.book_item, state="disabled")
-		self.book_button.grid(row=0, column=2, padx=(8, 0))
-		self.unavailable_button = ttk.Button(
-			buttons, text="Mark Unavailable", command=self.toggle_unavailable, state="disabled"
+		self.checkin_button.grid(row=0, column=3, padx=(0, 8))
+		self.book_button = ttk.Button(actions, text="Book selected", command=self.book_multi_scan_queue, state="disabled")
+		self.book_button.grid(row=0, column=4)
+		ttk.Button(actions, text="Clear selection", command=self.clear_multi_scan_queue).grid(
+			row=0, column=5, padx=(8, 0)
 		)
-		self.unavailable_button.grid(row=0, column=3, padx=(8, 0))
-		self.photo_preview = ttk.Label(details, text="No photo", anchor="center")
-		self.photo_preview.grid(row=0, column=2, rowspan=5, padx=(24, 0), sticky="nsew")
-		self.photo_button = ttk.Button(details, text="Add / Change Photo", command=self.choose_photo, state="disabled")
-		self.photo_button.grid(row=5, column=2, padx=(24, 0), pady=(8, 0))
+		self.selection_status = tk.StringVar(value="No items selected")
+		ttk.Label(actions, textvariable=self.selection_status).grid(row=0, column=6, padx=(12, 0))
+		self.notification_settings_button = ttk.Button(
+			actions, text="Notification settings", command=self.notification_settings_dialog
+		)
+		self.notification_settings_button.grid(row=0, column=7, padx=(8, 0))
+		self.web_api_settings_button = ttk.Button(
+			actions, text="Web sync setup", command=self.web_api_settings_dialog
+		)
+		self.web_api_settings_button.grid(row=0, column=8, padx=(8, 0))
+		self.action_feedback = tk.StringVar(value="Scan an item or select it below.")
+		self.action_feedback_label = tk.Label(
+			actions, textvariable=self.action_feedback, anchor="w", foreground="#344054",
+			font=("Segoe UI", 10, "bold"), wraplength=700,
+		)
+		self.action_feedback_label.grid(row=1, column=0, columnspan=9, sticky="ew", pady=(6, 0))
 
-		tips_frame = ttk.LabelFrame(self.root, text="Tips and Rules", padding=10)
-		tips_frame.grid(row=3, column=0, padx=20, pady=(0, 8), sticky="ew")
-		tips_frame.columnconfigure(0, weight=1)
-		self.tips_and_rules_text = tk.Text(tips_frame, height=20, wrap="word", undo=True)
-		self.tips_and_rules_text.grid(row=0, column=0, sticky="ew")
-		self.tips_and_rules_text.insert("1.0", self.get_setting("tips_and_rules", ""))
-		self.tips_and_rules_text.bind("<<Modified>>", self.save_tips_and_rules_text)
-		self.tips_and_rules_text.edit_modified(False)
-		self.tips_and_rules_text.configure(state="disabled")
-
-		list_frame = ttk.LabelFrame(self.root, text="All items", padding=10)
+		list_frame = ttk.LabelFrame(self.root, text="Inventory", padding=10)
 		list_frame.grid(row=4, column=0, padx=20, pady=(0, 20), sticky="nsew")
 		list_frame.columnconfigure(0, weight=1)
-		list_frame.rowconfigure(1, weight=1)
-		self.root.rowconfigure(4, weight=1)
+		list_frame.rowconfigure(2, weight=1)
 		search = ttk.Entry(list_frame, textvariable=self.search_value)
 		search.grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 8))
 		search.insert(0, "Search barcode or item name")
@@ -2714,59 +3575,112 @@ class CheckInSystem:
 		search.bind("<KeyRelease>", lambda _: self.refresh_items())
 		self.add_button = ttk.Button(list_frame, text="Add item", command=self.add_item_dialog, state="disabled")
 		self.add_button.grid(row=0, column=1, pady=(0, 8))
+		self.edit_button = ttk.Button(list_frame, text="Edit item", command=self.edit_item_dialog, state="disabled")
+		self.edit_button.grid(row=0, column=2, padx=(8, 0), pady=(0, 8))
+		self.photo_button = ttk.Button(list_frame, text="Photo", command=self.choose_photo, state="disabled")
+		self.photo_button.grid(row=0, column=3, padx=(8, 0), pady=(0, 8))
+		self.unavailable_button = ttk.Button(
+			list_frame, text="Mark Unavailable", command=self.toggle_unavailable, state="disabled"
+		)
+		self.unavailable_button.grid(row=0, column=4, padx=(8, 0), pady=(0, 8))
 		self.delete_button = ttk.Button(
 			list_frame, text="Delete item", command=self.delete_selected_item, state="disabled"
 		)
-		self.delete_button.grid(row=0, column=2, padx=(8, 0), pady=(0, 8))
-		self.edit_button = ttk.Button(
-			list_frame, text="Edit item", command=self.edit_item_dialog, state="disabled"
-		)
-		self.edit_button.grid(row=0, column=3, padx=(8, 0), pady=(0, 8))
+		self.delete_button.grid(row=0, column=5, padx=(8, 0), pady=(0, 8))
 		self.category_button = ttk.Button(
 			list_frame, text="Manage categories", command=self.manage_categories_dialog, state="disabled"
 		)
-		self.category_button.grid(row=0, column=4, padx=(8, 0), pady=(0, 8))
+		self.category_button.grid(row=0, column=6, padx=(8, 0), pady=(0, 8))
 
-		columns = ("barcode", "name", "category", "status", "borrower", "time")
-		self.items_table = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="browse")
-		self.items_table.tag_configure("checked_out", background="#ffd9d9", foreground="#9b1c1c")
-		self.items_table.tag_configure("available", background="#dff4df", foreground="#176b2c")
-		self.items_table.tag_configure("unavailable", background="#e6e6e6", foreground="#555555")
-		self.items_table.tag_configure("reserved", background="#fff0cc", foreground="#8a5a00")
-		headings = {
-			"barcode": "Barcode", "name": "Item", "category": "Category", "status": "Status",
-			"borrower": "Borrowed by", "time": "Time",
-		}
-		widths = {"barcode": 125, "name": 170, "category": 120, "status": 100, "borrower": 135, "time": 125}
-		for column in columns:
-			self.items_table.heading(column, text=headings[column])
-			self.items_table.column(column, width=widths[column], anchor="w")
-		self.items_table.grid(row=1, column=0, columnspan=2, sticky="nsew")
-		scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.items_table.yview)
-		scrollbar.grid(row=1, column=2, sticky="ns")
-		self.items_table.configure(yscrollcommand=scrollbar.set)
-		self.items_table.bind("<<TreeviewSelect>>", self.select_table_item)
+		columns_header = ttk.Frame(list_frame)
+		columns_header.grid(row=1, column=0, columnspan=7, sticky="ew", pady=(0, 4))
+		columns_header.columnconfigure(2, weight=3)
+		columns_header.columnconfigure(3, weight=1)
+		columns_header.columnconfigure(4, weight=2)
+		for column, label in ((2, "Item"), (3, "Status"), (4, "Borrowed by")):
+			ttk.Label(columns_header, text=label).grid(row=0, column=column, sticky="w", padx=8)
 
-	def save_tips_and_rules_text(self, event: object | None = None) -> None:
-		"""Persist the admin-entered tips and rules text so it remains visible and saved."""
-		if self.tips_and_rules_text is None or not self.admin_mode:
-			if self.tips_and_rules_text is not None:
-				self.tips_and_rules_text.edit_modified(False)
-			return
-		text = self.tips_and_rules_text.get("1.0", tk.END).rstrip("\n")
-		self.set_setting("tips_and_rules", text)
-		self.tips_and_rules_text.edit_modified(False)
+		items_container = ttk.Frame(list_frame)
+		items_container.grid(row=2, column=0, columnspan=7, sticky="nsew")
+		items_container.columnconfigure(0, weight=1)
+		items_container.rowconfigure(0, weight=1)
+		self.items_canvas = tk.Canvas(items_container, highlightthickness=0, borderwidth=0)
+		self.items_canvas.grid(row=0, column=0, sticky="nsew")
+		items_scrollbar = ttk.Scrollbar(items_container, orient="vertical", command=self.items_canvas.yview)
+		items_scrollbar.grid(row=0, column=1, sticky="ns")
+		self.items_canvas.configure(yscrollcommand=items_scrollbar.set)
+
+		def scroll_inventory_items(event):
+			"""Scroll the inventory canvas with the mouse wheel or trackpad."""
+			canvas_left = self.items_canvas.winfo_rootx()
+			canvas_top = self.items_canvas.winfo_rooty()
+			if not (
+				canvas_left <= event.x_root < canvas_left + self.items_canvas.winfo_width()
+				and canvas_top <= event.y_root < canvas_top + self.items_canvas.winfo_height()
+			):
+				return
+			if getattr(event, "delta", 0):
+				steps = max(1, abs(event.delta) // 120)
+				self.items_canvas.yview_scroll(-steps if event.delta > 0 else steps, "units")
+			elif getattr(event, "num", None) == 4:
+				self.items_canvas.yview_scroll(-1, "units")
+			elif getattr(event, "num", None) == 5:
+				self.items_canvas.yview_scroll(1, "units")
+			return "break"
+
+		self.root.bind_all("<MouseWheel>", scroll_inventory_items, add="+")
+		self.root.bind_all("<Button-4>", scroll_inventory_items, add="+")
+		self.root.bind_all("<Button-5>", scroll_inventory_items, add="+")
+
+		self.items_inner = ttk.Frame(self.items_canvas)
+		self.items_window = self.items_canvas.create_window((0, 0), window=self.items_inner, anchor="nw")
+		self.items_inner.bind(
+			"<Configure>",
+			lambda _event: self.items_canvas.configure(scrollregion=self.items_canvas.bbox("all")),
+		)
+		self.items_canvas.bind(
+			"<Configure>",
+			lambda event: self.items_canvas.itemconfigure(self.items_window, width=event.width),
+		)
+		self.items_inner.columnconfigure(2, weight=3)
+		self.items_inner.columnconfigure(3, weight=1)
+		self.items_inner.columnconfigure(4, weight=2)
+
+	def create_colored_action_button(
+		self,
+		parent: tk.Misc,
+		text: str,
+		command,
+		background: str,
+		active_background: str,
+	) -> tk.Label:
+		"""Build a keyboard-accessible colored action control that renders on macOS Aqua."""
+		button = tk.Label(
+			parent, text=text, bg=background, fg="#ffffff",
+			font=("Segoe UI", 12, "bold"), width=13, height=2,
+			padx=10, pady=8, relief="raised", borderwidth=1,
+			cursor="hand2", takefocus=True,
+		)
+		button.bind("<Enter>", lambda _event: button.configure(bg=active_background))
+		button.bind("<Leave>", lambda _event: button.configure(bg=background, relief="raised"))
+		button.bind("<ButtonPress-1>", lambda _event: button.configure(relief="sunken"))
+		def activate(_event=None):
+			button.configure(bg=active_background, relief="raised")
+			command()
+			return "break"
+		button.bind("<ButtonRelease-1>", activate)
+		button.bind("<Return>", lambda _event: command())
+		button.bind("<space>", lambda _event: command())
+		return button
 
 	def refresh_items(self) -> None:
-		"""Reload the item list, hiding unavailable items outside admin mode.
-
-		Items are grouped by category (in the admin-defined priority order set in
-		Manage categories), so a checked-out item stays with its category instead of
-		jumping to a separate "checked out" section. Within each category they are
-		ordered Available/Reserved first, then Checked out, then Unavailable, then by name.
-		"""
-		for row_id in self.items_table.get_children():
-			self.items_table.delete(row_id)
+		"""Rebuild the scrollable inventory with selected items at the top."""
+		for child in self.items_inner.winfo_children():
+			child.destroy()
+		self.item_selection_vars.clear()
+		self.item_row_images.clear()
+		self.item_row_frames.clear()
+		self.item_row_separators.clear()
 		search = self.search_value.get().strip()
 		if search == "Search barcode or item name":
 			search = ""
@@ -2779,30 +3693,126 @@ class CheckInSystem:
 			+ where_clause + " "
 			"ORDER BY COALESCE(categories.sort_order, 999999), COALESCE(items.category, '') COLLATE NOCASE, "
 			"CASE "
+			"WHEN items.missing = 1 THEN 3 "
 			"WHEN items.unavailable = 1 THEN 2 "
 			"WHEN items.checked_out_by IS NOT NULL THEN 1 "
 			"ELSE 0 END, items.name COLLATE NOCASE",
 			(f"%{search}%", f"%{search}%", f"%{search}%"),
 		).fetchall()
-		for row in rows:
+		self.item_base_order = [row["barcode"] for row in rows]
+		selected_order = {barcode: index for index, barcode in enumerate(self.multi_scan_queue)}
+		rows = sorted(
+			rows,
+			key=lambda row: (
+				0 if row["barcode"] in selected_order else 1,
+				selected_order.get(row["barcode"], 0),
+			),
+		)
+		if not rows:
+			ttk.Label(self.items_inner, text="No items match this search.").grid(
+				row=0, column=0, columnspan=5, sticky="w", padx=12, pady=18
+			)
+		for row_index, row in enumerate(rows):
 			today_reservation = self.get_reservation(row["barcode"])
-			if row["unavailable"]:
-				status, row_tag = "Unavailable", "unavailable"
+			if row["missing"]:
+				status, status_color = "Missing", "#ff0000"
+			elif row["unavailable"]:
+				status, status_color = "Unavailable", "#333333"
 			elif row["checked_out_by"]:
-				status, row_tag = (
-					("Late", "checked_out") if row["checkout_late"] else ("Checked out", "checked_out")
-				)
+				status, status_color = ("Late", "#c62828") if row["checkout_late"] else ("Checked out", "#c62828")
 			elif today_reservation:
-				status, row_tag = "Reserved", "reserved"
+				status, status_color = "Reserved", "#333333"
 			else:
-				status, row_tag = "Available", "available"
-			self.items_table.insert("", "end", iid=row["barcode"], values=(
-				row["barcode"], row["name"], row["category"] or "Uncategorized", status,
-				row["checked_out_by"] or "", self.checkout_time_display(row),
-			), tags=(row_tag,))
+				status, status_color = "Available", "#208a3c"
+			row_frame = ttk.Frame(self.items_inner, padding=(4, 5))
+			row_frame.grid(row=row_index * 2, column=0, columnspan=5, sticky="ew")
+			self.item_row_frames[row["barcode"]] = row_frame
+			row_frame.bind(
+				"<Button-1>",
+				lambda _event, barcode=row["barcode"]: self.toggle_item_selected_from_row(barcode),
+			)
+			for column, weight in ((2, 3), (3, 1), (4, 2)):
+				row_frame.columnconfigure(column, weight=weight)
+			selected = row["barcode"] in selected_order
+			selection_var = tk.BooleanVar(value=selected)
+			self.item_selection_vars[row["barcode"]] = selection_var
+			ttk.Checkbutton(
+				row_frame,
+				variable=selection_var,
+				command=lambda barcode=row["barcode"], value=selection_var: self.set_item_selected(barcode, value.get()),
+			).grid(row=0, column=0, rowspan=2, padx=(4, 10))
+			if row["photo_path"]:
+				try:
+					image = Image.open(row["photo_path"])
+					image.thumbnail((56, 56))
+					photo = ImageTk.PhotoImage(image)
+					self.item_row_images.append(photo)
+					photo_label = ttk.Label(row_frame, image=photo)
+					photo_label.grid(row=0, column=1, rowspan=2, padx=(0, 12))
+				except (FileNotFoundError, OSError):
+					photo_label = ttk.Label(row_frame, text="No photo", width=9)
+					photo_label.grid(row=0, column=1, rowspan=2, padx=(0, 12))
+			else:
+				photo_label = ttk.Label(row_frame, text="No photo", width=9)
+				photo_label.grid(row=0, column=1, rowspan=2, padx=(0, 12))
+			photo_label.bind(
+				"<Button-1>",
+				lambda _event, barcode=row["barcode"]: self.toggle_item_selected_from_row(barcode),
+			)
+			name_label = ttk.Label(
+				row_frame, text=row["name"], font=("Segoe UI", 11, "bold"), foreground=status_color
+			)
+			name_label.grid(
+				row=0, column=2, sticky="w", padx=8
+			)
+			barcode_label = ttk.Label(
+				row_frame,
+				text=f"{row['barcode']}  ·  {row['category'] or 'Uncategorized'}",
+				foreground="#666666",
+			)
+			barcode_label.grid(row=1, column=2, sticky="w", padx=8)
+			status_label = tk.Label(row_frame, text=status, foreground=status_color, font=("Segoe UI", 10, "bold"))
+			status_label.grid(row=0, column=3, rowspan=2, sticky="w", padx=8)
+			borrower_label = tk.Label(row_frame, text=row["checked_out_by"] or "—")
+			borrower_label.grid(
+				row=0, column=4, rowspan=2, sticky="w", padx=8
+			)
+			for row_widget in (name_label, barcode_label, status_label, borrower_label):
+				row_widget.bind(
+					"<Button-1>",
+					lambda _event, barcode=row["barcode"]: self.toggle_item_selected_from_row(barcode),
+				)
+			separator = ttk.Separator(self.items_inner, orient="horizontal")
+			self.item_row_separators[row["barcode"]] = separator
+		self.reorder_inventory_rows()
+		self.update_admin_controls()
+
+	def reorder_inventory_rows(self) -> None:
+		"""Move existing inventory rows to reflect selection order without rebuilding them."""
+		selected_order = {barcode: index for index, barcode in enumerate(self.multi_scan_queue)}
+		base_order = {barcode: index for index, barcode in enumerate(self.item_base_order)}
+		ordered_barcodes = sorted(
+			self.item_base_order,
+			key=lambda barcode: (
+				(0, selected_order[barcode]) if barcode in selected_order else (1, base_order[barcode])
+			),
+		)
+		for row_index, barcode in enumerate(ordered_barcodes):
+			self.item_row_frames[barcode].grid_configure(row=row_index * 2)
+			separator = self.item_row_separators[barcode]
+			if row_index < len(ordered_barcodes) - 1:
+				separator.grid(row=row_index * 2 + 1, column=0, columnspan=5, sticky="ew")
+			else:
+				separator.grid_remove()
+
+	def toggle_item_selected_from_row(self, barcode: str) -> str:
+		"""Toggle one inventory item's checkbox when any non-checkbox part of its row is clicked."""
+		currently_selected = barcode in self.multi_scan_queue
+		self.set_item_selected(barcode, not currently_selected)
+		return "break"
 
 	def scan_item(self, event_or_barcode: tk.Event | str | None = None, force: bool = False) -> None:
-		"""Look up a scanned/typed barcode: add it to the multi-scan queue, or select it for single-item actions."""
+		"""Look up a scanned or typed barcode and add the item to the current selection."""
 		if isinstance(event_or_barcode, tk.Event):
 			if hasattr(event_or_barcode.widget, 'get'):
 				barcode = event_or_barcode.widget.get().strip()
@@ -2829,11 +3839,11 @@ class CheckInSystem:
 			if len(accounts) == 1:
 				self.scan_value.set("")
 				self.borrower_name.set(accounts[0]["full_name"])
-				self.borrower_entry.focus_set()
+				self.scan_entry.focus_set()
 				return
 			self.clear_selection()
 			self.scan_entry.focus_set()
-			messagebox.showinfo("Unknown barcode", f"No item is registered for barcode {barcode}.\nUse Add item to register it.")
+			self.set_action_feedback(f"No item found for barcode {barcode}.", "error")
 			return
 
 		# Clear the scan entry box to prepare for the next scan
@@ -2856,11 +3866,14 @@ class CheckInSystem:
 			else:
 				self.play_sound("Error")
 			return
+		if row["missing"]:
+			with self.db_lock:
+				self.database.execute("UPDATE items SET missing = 0 WHERE barcode = ?", (barcode,))
+				self.database.commit()
+			row = self.database.execute("SELECT * FROM items WHERE barcode = ?", (barcode,)).fetchone()
+			self.refresh_items()
 
-		if self.multi_scan_enabled.get():
-			self.add_to_multi_scan_queue(row)
-			return
-		self.show_item(row)
+		self.add_to_multi_scan_queue(row)
 
 	def _install_scan_capture_binding(self, event: tk.Event | None = None) -> None:
 		"""Put the scan snapshot binding ahead of normal text-entry behavior.
@@ -2943,7 +3956,7 @@ class CheckInSystem:
 		self.scan_burst_started_at = 0.0
 
 		# The Scan entry's own Return binding has already handled this one.  Just
-		# clear the duplicate global buffer so multi-scan mode cannot queue twice.
+		# Clear the duplicate global buffer so this scanner input is handled once.
 		if event.widget == self.scan_entry:
 			self._clear_scan_capture()
 			return None
@@ -2969,7 +3982,9 @@ class CheckInSystem:
 		"""Update the details panel with the selected item's information."""
 		self.selected_barcode = row["barcode"]
 		self.item_name.set(row["name"])
-		if row["unavailable"]:
+		if row["missing"]:
+			status = "Missing"
+		elif row["unavailable"]:
 			status = "Unavailable"
 		elif row["checked_out_by"]:
 			status = "Late" if row["checkout_late"] else "Checked out"
@@ -2982,68 +3997,107 @@ class CheckInSystem:
 		self.item_status.set(status)
 		self.item_category.set(row["category"] or "Uncategorized")
 		self.borrower_name.set(row["checked_out_by"] or "")
-		self.update_photo_preview(row["photo_path"]) if row["photo_path"] else self.photo_preview.configure(image="", text="No photo")
+		if row["photo_path"] and hasattr(self, "photo_preview"):
+			self.update_photo_preview(row["photo_path"])
 		self.update_admin_controls()
 
-	def toggle_multi_scan_mode(self) -> None:
-		"""Show or hide the multi-scan queue panel to match the checkbox."""
-		if self.multi_scan_enabled.get():
-			self.multi_scan_frame.grid()
-		else:
-			self.multi_scan_frame.grid_remove()
-		self.scan_entry.focus_set()
-
 	def add_to_multi_scan_queue(self, row: sqlite3.Row) -> None:
-		"""Queue a scanned item for batch checkout; a duplicate scan just beeps instead of adding twice."""
+		"""Select a scanned item and move it to the top of the inventory list."""
 		barcode = row["barcode"]
-		if barcode in self.multi_scan_queue:
-			self.root.bell()
-			return
-		self.multi_scan_queue.append(barcode)
-		self.refresh_multi_scan_queue()
-		self.play_sound("Tink")
+		already_selected = barcode in self.multi_scan_queue
+		if already_selected:
+			self.multi_scan_queue.remove(barcode)
+			self.multi_scan_queue.insert(0, barcode)
+		else:
+			self.multi_scan_queue.insert(0, barcode)
+		self.reset_selection_clear_timer()
+		self.selected_barcode = barcode
+		selection_var = self.item_selection_vars.get(barcode)
+		if selection_var:
+			selection_var.set(True)
+		self.reorder_inventory_rows()
+		self.items_canvas.yview_moveto(0)
+		self.update_admin_controls()
+		feedback = f"{row['name']} is selected."
+		self.set_action_feedback(feedback, "neutral" if already_selected else "selection")
 
-	def refresh_multi_scan_queue(self) -> None:
-		"""Redraw the multi-scan queue table from self.multi_scan_queue."""
-		for row_id in self.multi_scan_table.get_children():
-			self.multi_scan_table.delete(row_id)
-		for barcode in self.multi_scan_queue:
-			row = self.database.execute("SELECT * FROM items WHERE barcode = ?", (barcode,)).fetchone()
-			if row is None:
-				continue
-			if row["unavailable"]:
-				status = "Unavailable"
-			elif row["checked_out_by"]:
-				status = "Late" if row["checkout_late"] else "Checked out"
-			else:
-				status = "Available"
-			self.multi_scan_table.insert("", "end", iid=barcode, values=(barcode, row["name"], status))
-
-	def remove_from_multi_scan_queue(self) -> None:
-		"""Drop the selected queue row(s) without affecting their item's actual status."""
-		for barcode in self.multi_scan_table.selection():
+	def set_item_selected(self, barcode: str, selected: bool) -> None:
+		"""Add or remove an item from the shared manual and scanner selection."""
+		if selected:
+			if barcode not in self.multi_scan_queue:
+				self.multi_scan_queue.append(barcode)
+			self.selected_barcode = barcode
+		else:
 			if barcode in self.multi_scan_queue:
 				self.multi_scan_queue.remove(barcode)
-		self.refresh_multi_scan_queue()
+			if self.selected_barcode == barcode:
+				self.selected_barcode = self.multi_scan_queue[0] if self.multi_scan_queue else None
+		if self.multi_scan_queue:
+			self.reset_selection_clear_timer()
+		else:
+			self.cancel_selection_clear_timer()
+		selection_var = self.item_selection_vars.get(barcode)
+		if selection_var:
+			selection_var.set(selected)
+		self.reorder_inventory_rows()
+		self.update_admin_controls()
+		count = len(self.multi_scan_queue)
+		self.set_action_feedback(
+			f"{count} item(s) selected." if count else "No items selected.", "neutral"
+		)
+
+	def reset_selection_clear_timer(self) -> None:
+		"""Clear the current selection three minutes after its latest change."""
+		self.cancel_selection_clear_timer()
+		if self.multi_scan_queue:
+			self.selection_clear_after_id = self.root.after(
+				SELECTION_CLEAR_DELAY_MS, self.clear_selection_after_timeout
+			)
+
+	def cancel_selection_clear_timer(self) -> None:
+		"""Cancel the pending selection expiry, if one is scheduled."""
+		if self.selection_clear_after_id is not None:
+			try:
+				self.root.after_cancel(self.selection_clear_after_id)
+			except tk.TclError:
+				pass
+			self.selection_clear_after_id = None
+
+	def clear_selection_after_timeout(self) -> None:
+		"""Clear selected items after three minutes without selection activity."""
+		self.selection_clear_after_id = None
+		if not self.multi_scan_queue:
+			return
+		self.clear_multi_scan_queue()
+		self.set_action_feedback("Selection cleared after 3 minutes.", "neutral")
+
+	def refresh_multi_scan_queue(self) -> None:
+		"""Refresh the inventory view after a batch selection or checkout change."""
+		self.refresh_items()
+
+	def remove_from_multi_scan_queue(self) -> None:
+		"""Clear the shared selection without affecting item status."""
+		self.clear_multi_scan_queue()
 
 	def clear_multi_scan_queue(self) -> None:
-		"""Empty the multi-scan queue."""
+		"""Clear all manually or scanner-selected inventory items."""
+		self.cancel_selection_clear_timer()
 		self.multi_scan_queue.clear()
+		self.selected_barcode = None
 		self.refresh_multi_scan_queue()
+		self.update_admin_controls()
 
 	def checkout_multi_scan_queue(self) -> None:
-		"""Check out every queued item to one borrower in a single batch, skipping any that aren't available."""
+		"""Check out selected items to one borrower, skipping items that aren't available."""
 		if not self.multi_scan_queue:
-			messagebox.showwarning("Queue is empty", "Scan at least one item before checking out.")
+			self.set_action_feedback("Select or scan an item before checking out.", "error")
 			return
 		account = self.resolve_borrower_account(self.root)
 		if account is None:
 			return
 		schedule_enabled = self.bell_schedule_enabled()
-		checkout_mode = "period"
 		if schedule_enabled:
-			checkout_mode = self.choose_checkout_duration(self.root)
-			due_at = self.checkout_due_time(checkout_mode) if schedule_enabled else None
+			due_at = self.choose_checkout_due_time(self.root)
 		else:
 			due_at = None
 		if schedule_enabled and due_at is None:
@@ -3052,18 +4106,22 @@ class CheckInSystem:
 		timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 		due_timestamp = due_at.strftime("%Y-%m-%d %H:%M") if due_at else None
 		checked_out: list[str] = []
+		checked_out_barcodes: list[str] = []
 		skipped: list[str] = []
 		with self.db_lock:
 			for barcode in list(self.multi_scan_queue):
 				try:
 					item = self.database.execute(
-						"SELECT name, checked_out_by, unavailable FROM items WHERE barcode = ?", (barcode,)
+						"SELECT name, checked_out_by, unavailable, missing FROM items WHERE barcode = ?", (barcode,)
 					).fetchone()
 					if item is None:
 						skipped.append(f"{barcode} (not found)")
 						continue
 					if item["unavailable"]:
 						skipped.append(f"{item['name']} (unavailable)")
+						continue
+					if item["missing"]:
+						skipped.append(f"{item['name']} (marked missing; scan it before checkout)")
 						continue
 					if item["checked_out_by"]:
 						skipped.append(f"{item['name']} (already checked out)")
@@ -3076,27 +4134,31 @@ class CheckInSystem:
 					self.record_history(barcode, item["name"], "Checked out", borrower)
 					self.mark_recently_changed(barcode)
 					checked_out.append(item["name"])
+					checked_out_barcodes.append(barcode)
 				except Exception as e:
 					skipped.append(f"Error with {barcode}: {str(e)}")
 
 			self.database.commit()
 		self.multi_scan_queue.clear()
+		self.cancel_selection_clear_timer()
+		self.selected_barcode = None
 		self.refresh_multi_scan_queue()
-		self.refresh_items()
 		if checked_out:
 			self.sync_to_google_sheets(show_result=False)
-			self.play_sound("Pop")
+			for barcode in checked_out_barcodes:
+				self.queue_web_service_checkout_sync(barcode)
 		message = f"Checked out {len(checked_out)} item(s) to {borrower}."
 		if skipped:
 			message += "\nSkipped: " + ", ".join(skipped)
-		messagebox.showinfo("Multi-scan checkout", message)
+		self.set_action_feedback(message, "error" if skipped or not checked_out else "success")
 
 	def checkin_multi_scan_queue(self) -> None:
-		"""Check in every queued item in a single batch, skipping any that aren't checked out."""
+		"""Check in selected checked-out items, skipping the rest."""
 		if not self.multi_scan_queue:
-			messagebox.showwarning("Queue is empty", "Scan at least one item before checking in.")
+			self.set_action_feedback("Select a checked-out item before checking it in.", "error")
 			return
 		checked_in: list[str] = []
+		checked_in_barcodes: list[str] = []
 		skipped: list[str] = []
 		with self.db_lock:
 			for barcode in list(self.multi_scan_queue):
@@ -3120,13 +4182,14 @@ class CheckInSystem:
 						skipped.append(f"{item['name']} (check-in failed)")
 						continue
 					
-					self.record_history(barcode, item["name"], "Checked in", None)
+					self.record_history(barcode, item["name"], "Checked in", item["checked_out_by"])
 					self.mark_recently_changed(barcode)
 					self.database.execute(
 						"DELETE FROM reservations WHERE barcode = ? AND reserved_date <= ?",
 						(barcode, datetime.now().strftime("%Y-%m-%d")),
 					)
 					checked_in.append(item["name"])
+					checked_in_barcodes.append(barcode)
 				except Exception as e:
 					skipped.append(f"{barcode} (error: {str(e)})")
 			self.database.commit()
@@ -3134,12 +4197,12 @@ class CheckInSystem:
 		message = f"Checked in {len(checked_in)} item(s)."
 		if skipped:
 			message += "\nSkipped: " + ", ".join(skipped)
-		messagebox.showinfo("Multi-scan check-in", message)
 		self.clear_multi_scan_queue()
-		self.refresh_items()
+		self.set_action_feedback(message, "error" if skipped or not checked_in else "success")
 		if checked_in:
 			self.sync_to_google_sheets(show_result=False)
-			self.play_sound("Pop")
+			for barcode in checked_in_barcodes:
+				self.queue_web_service_checkout_sync(barcode)
 
 	def update_photo_preview(self, photo_path: str) -> None:
 		"""Update the photo preview with the image at photo_path."""
@@ -3166,6 +4229,7 @@ class CheckInSystem:
 		row = self.database.execute("SELECT * FROM items WHERE barcode = ?", (self.selected_barcode,)).fetchone()
 		if row:
 			self.show_item(row)
+			self.refresh_items()
 
 	def edit_item_dialog(self) -> None:
 		"""Admin only: edit an item's name, category, barcode, or photo."""
@@ -3248,14 +4312,6 @@ class CheckInSystem:
 
 		ttk.Button(frame, text="Save changes", command=save).grid(row=4, column=1, sticky="e", pady=(12, 0))
 
-	def select_table_item(self, _event: tk.Event) -> None:
-		"""Show details for whichever row the user clicked in the item list."""
-		selected = self.items_table.selection()
-		if selected:
-			row = self.database.execute("SELECT * FROM items WHERE barcode = ?", (selected[0],)).fetchone()
-			if row:
-				self.show_item(row)
-
 	def checkout_due_time(self, mode: str = "period", current: datetime | None = None) -> datetime | None:
 		"""Return the due time for a new checkout, either this period or the next school-day first period."""
 		current = current or datetime.now()
@@ -3297,9 +4353,29 @@ class CheckInSystem:
 			f"{period['period_date']} {period['end_time']}", "%Y-%m-%d %H:%M"
 		)
 
-	def choose_checkout_duration(self, parent: tk.Misc | None = None) -> str:
-		"""Let the user choose whether a checkout is for a single period or the whole day."""
-		selected = {"value": "period"}
+	def checkout_due_time_after_dates(self, selected_dates: set[str]) -> datetime | None:
+		"""Return the end of the first period on the next scheduled day after the last selected date."""
+		if not selected_dates:
+			return None
+		first_period = self.database.execute(
+			"SELECT period_date, end_time FROM bell_periods "
+			"WHERE period_date > ? ORDER BY period_date, start_time LIMIT 1",
+			(max(selected_dates),),
+		).fetchone()
+		if first_period is None:
+			messagebox.showwarning(
+				"No next school day",
+				"Add a bell schedule after the last selected checkout day before checking out equipment.",
+				parent=self.root,
+			)
+			return None
+		return datetime.strptime(
+			f"{first_period['period_date']} {first_period['end_time']}", "%Y-%m-%d %H:%M"
+		)
+
+	def choose_checkout_duration(self, parent: tk.Misc | None = None) -> str | None:
+		"""Let the user choose a period, one day, or multiple days for checkout."""
+		selected = {"value": None}
 		dialog = tk.Toplevel(parent or self.root)
 		dialog.title("Checkout duration")
 		dialog.transient(parent or self.root)
@@ -3317,11 +4393,31 @@ class CheckInSystem:
 		tk.Button(frame, text="Entire day", width=16, command=lambda: choose("day")).grid(
 			row=1, column=0, **button_padx
 		)
-		tk.Button(frame, text="Of the period", width=16, command=lambda: choose("period")).grid(
+		tk.Button(frame, text="For the period", width=16, command=lambda: choose("period")).grid(
 			row=1, column=1, **button_padx
+		)
+		tk.Button(frame, text="Multiple days", command=lambda: choose("multiple_days")).grid(
+			row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 6)
 		)
 		dialog.wait_window()
 		return selected["value"]
+
+	def choose_checkout_due_time(self, parent: tk.Misc | None = None) -> datetime | None:
+		"""Ask for a checkout duration and resolve its due time, including selected checkout days."""
+		mode = self.choose_checkout_duration(parent)
+		if mode is None:
+			return None
+		if mode == "multiple_days":
+			selected_dates = self.choose_schedule_dates(
+				parent or self.root,
+				title="Select checkout days",
+				instruction="Today stays selected. Pick an end date to select every day through that date.",
+				continuous_from_today=True,
+			)
+			if selected_dates is None:
+				return None
+			return self.checkout_due_time_after_dates(selected_dates)
+		return self.checkout_due_time(mode)
 
 	def check_out(self) -> None:
 		"""Check the selected item out to the typed borrower.
@@ -3330,40 +4426,47 @@ class CheckInSystem:
 		the item is still available, so a concurrent background sheet sync can't
 		cause this to report success when nothing actually changed.
 		"""
-		if self.multi_scan_enabled.get():
+		if len(self.multi_scan_queue) > 1:
 			self.checkout_multi_scan_queue()
 			return
 
 		if not self.selected_barcode:
-			messagebox.showwarning("No item selected", "Scan or select an item first.")
+			self.set_action_feedback("Scan or select an item before checking it out.", "error")
 			return
 		account = self.resolve_borrower_account(self.root)
 		if account is None:
 			return
+		borrower = account["full_name"]
+		reservation = self.get_reservation(self.selected_barcode)
+		is_booked_for_borrower = bool(
+			reservation and self.names_match(reservation["borrower"], borrower)
+		)
 		schedule_enabled = self.bell_schedule_enabled()
-		checkout_mode = "period"
 		if schedule_enabled:
-			checkout_mode = self.choose_checkout_duration(self.root)
-			due_at = self.checkout_due_time(checkout_mode) if schedule_enabled else None
+			if is_booked_for_borrower:
+				booked_dates = self.get_booking_dates(
+					self.selected_barcode, borrower, reservation["created_at"]
+				)
+				due_at = self.checkout_due_time_after_dates(booked_dates)
+			else:
+				due_at = self.choose_checkout_due_time(self.root)
 		else:
 			due_at = None
 		if schedule_enabled and due_at is None:
 			return
 		succeeded = False
-		borrower = account["full_name"]
 		with self.db_lock:
 			item = self.database.execute(
-				"SELECT name, unavailable FROM items WHERE barcode = ?", (self.selected_barcode,)
+				"SELECT name, unavailable, missing FROM items WHERE barcode = ?", (self.selected_barcode,)
 			).fetchone()
-			if item and item["unavailable"]:
-				messagebox.showwarning("Item unavailable", "An admin must mark this item available before checkout.")
+			if item and item["missing"]:
+				self.set_action_feedback("This item is marked missing. Scan it to confirm it is here.", "error")
 				return
-			reservation = self.get_reservation(self.selected_barcode)
-			if reservation and not self.names_match(reservation["borrower"], self.borrower_name.get()):
-				messagebox.showwarning(
-					"Item reserved",
-					f"This item is reserved today for {reservation['borrower']}.",
-				)
+			if item and item["unavailable"]:
+				self.set_action_feedback("This item is unavailable. Ask an admin for help.", "error")
+				return
+			if reservation and not self.names_match(reservation["borrower"], borrower):
+				self.set_action_feedback(f"This item is booked for {reservation['borrower']} today.", "error")
 				return
 			timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 			due_timestamp = due_at.strftime("%Y-%m-%d %H:%M") if due_at else None
@@ -3386,10 +4489,7 @@ class CheckInSystem:
 			).fetchone()
 			if current:
 				self.show_item(current)
-			messagebox.showwarning(
-				"Checkout failed",
-				"This item was just checked out or changed by someone else. Its current status is now shown.",
-			)
+			self.set_action_feedback("Checkout did not go through. Check the item's status and try again.", "error")
 			return
 		message = f"Item checked out to {borrower}."
 		if due_at:
@@ -3398,12 +4498,12 @@ class CheckInSystem:
 
 	def check_in(self) -> None:
 		"""Check the selected item back in, the same race-safe way as check_out."""
-		if self.multi_scan_enabled.get():
+		if len(self.multi_scan_queue) > 1:
 			self.checkin_multi_scan_queue()
 			return
 
 		if not self.selected_barcode:
-			messagebox.showwarning("No item selected", "Scan or select an item first.")
+			self.set_action_feedback("Scan or select an item before checking it in.", "error")
 			return
 		succeeded = False
 		with self.db_lock:
@@ -3418,7 +4518,7 @@ class CheckInSystem:
 			)
 			succeeded = bool(was_checked_out and update.rowcount)
 			if succeeded:
-				self.record_history(self.selected_barcode, item["name"], "Checked in", None)
+				self.record_history(self.selected_barcode, item["name"], "Checked in", item["checked_out_by"])
 				self.mark_recently_changed(self.selected_barcode)
 				self.database.execute(
 					"DELETE FROM reservations WHERE barcode = ? AND reserved_date <= ?",
@@ -3432,12 +4532,23 @@ class CheckInSystem:
 			).fetchone()
 			if current:
 				self.show_item(current)
-			messagebox.showwarning(
-				"Check-in failed",
-				"This item was already checked in or changed by someone else. Its current status is now shown.",
-			)
+			self.set_action_feedback("Check In did not go through. Check the item's status and try again.", "error")
 			return
 		self.finish_action("Item checked in and available.")
+
+	def set_action_feedback(self, message: str, tone: str = "neutral") -> None:
+		"""Show an action result in plain language and signal success or error audibly."""
+		foregrounds = {
+			"success": "#176b3a",
+			"error": "#a11212",
+			"selection": "#205c7a",
+			"neutral": "#344054",
+		}
+		self.action_feedback.set(message)
+		self.action_feedback_label.configure(foreground=foregrounds.get(tone, foregrounds["neutral"]))
+		sounds = {"success": "Pop", "error": "Error", "selection": "Tink"}
+		if tone in sounds:
+			self.play_sound(sounds[tone])
 
 	def play_sound(self, sound_name: str) -> None:
 		"""Play a short confirmation sound; falls back to the plain Tk bell off macOS or if the file is missing."""
@@ -3466,9 +4577,9 @@ class CheckInSystem:
 		self.book_items([(self.selected_barcode, row["name"])])
 
 	def book_multi_scan_queue(self) -> None:
-		"""Open the same calendar dialog to book every item currently in the multi-scan queue at once."""
+		"""Open the booking calendar for every currently selected item."""
 		if not self.multi_scan_queue:
-			messagebox.showwarning("Queue is empty", "Scan at least one item before booking.")
+			messagebox.showwarning("No items selected", "Select or scan at least one item before booking.")
 			return
 		items: list[tuple[str, str]] = []
 		missing: list[str] = []
@@ -3710,18 +4821,13 @@ class CheckInSystem:
 					parent=date_dialog,
 				):
 					return
-			request_rows = [
-				[date_text, barcode, borrower_name, "FALSE", "Pending"]
-				for date_text in sorted(selected_dates)
-				for barcode, _name in items
-			]
 			created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 			with self.db_lock:
 				for date_text in selected_dates:
 					for barcode, name in items:
 						if existing.get(date_text, {}).get(barcode):
 							self.database.execute(
-								"UPDATE reservations SET borrower = ?, created_at = ?, status = 'Pending' "
+								"UPDATE reservations SET borrower = ?, created_at = ?, status = 'Confirmed' "
 								"WHERE barcode = ? AND reserved_date = ?",
 								(borrower_name, created_at, barcode, date_text),
 							)
@@ -3729,12 +4835,11 @@ class CheckInSystem:
 							self.database.execute(
 								"INSERT INTO reservations "
 								"(barcode, item_name, reserved_date, borrower, created_at, status) "
-								"VALUES (?, ?, ?, ?, ?, 'Pending')",
+								"VALUES (?, ?, ?, ?, ?, 'Confirmed')",
 								(barcode, name, date_text, borrower_name, created_at),
 							)
 				self.database.commit()
-			if self.submit_booking_requests(request_rows, date_dialog):
-				date_dialog.destroy()
+			refresh_after_change()
 
 		def delete_booking() -> None:
 			existing = existing_bookings_for_selection()
@@ -3744,25 +4849,19 @@ class CheckInSystem:
 			if not to_delete:
 				return
 			blocked = []
-			pending_requests = []
 			for date_text, booking in to_delete:
-				if booking["status"] == "Confirmed" and not self.admin_mode:
-					blocked.append(f"{booking['item_name'] if 'item_name' in booking.keys() else booking['barcode']} on {date_text} (confirmed)")
-				elif booking["status"] == "Pending":
-					if not self.admin_mode and not self.booking_request_is_recent(booking["created_at"]):
-						blocked.append(f"{booking['barcode']} on {date_text} (pending for more than 5 minutes)")
-					else:
-						pending_requests.append((date_text, booking["barcode"], booking["borrower"]))
+				if not self.admin_mode and not self.booking_is_recent(booking["created_at"]):
+					blocked.append(f"{booking['barcode']} on {date_text} (created more than 5 minutes ago)")
 			if blocked:
 				messagebox.showwarning(
 					"Admin approval required",
-					"Only bookings requested within the last 5 minutes can be deleted without admin mode:\n"
+					"Bookings can only be deleted without admin mode within 5 minutes of creation:\n"
 					+ "\n".join(blocked),
 					parent=date_dialog,
 				)
 				return
 			if messagebox.askyesno(
-				"Delete Request",
+				"Delete booking",
 				f"Delete {len(to_delete)} booking(s) across {len(items)} item(s)?",
 				parent=date_dialog,
 			):
@@ -3770,12 +4869,11 @@ class CheckInSystem:
 					for _date_text, booking in to_delete:
 						self.database.execute("DELETE FROM reservations WHERE id = ?", (booking["id"],))
 					self.database.commit()
-				self.delete_booking_requests(pending_requests)
 				refresh_after_change()
 
-		delete_button = ttk.Button(frame, text="Delete Request", command=delete_booking, state="disabled")
+		delete_button = ttk.Button(frame, text="Delete Booking", command=delete_booking, state="disabled")
 		delete_button.grid(row=5, column=0, pady=(12, 0))
-		ttk.Button(frame, text="Request Booking", command=save_booking).grid(row=5, column=2, pady=(12, 0))
+		ttk.Button(frame, text="Book", command=save_booking).grid(row=5, column=2, pady=(12, 0))
 		build_calendar()
 		sync_selection_state()
 
@@ -3792,7 +4890,7 @@ class CheckInSystem:
 			messagebox.showwarning("Item is checked out", "Check the item in before marking it unavailable.")
 			return
 		self.database.execute(
-			"UPDATE items SET unavailable = ? WHERE barcode = ?",
+			"UPDATE items SET unavailable = ?, missing = 0 WHERE barcode = ?",
 			(0 if row["unavailable"] else 1, self.selected_barcode),
 		)
 		self.database.commit()
@@ -3806,24 +4904,28 @@ class CheckInSystem:
 		self.sync_to_google_sheets(show_result=False)
 
 	def finish_action(self, message: str) -> None:
-		"""Common tail end of a successful check-in/out: notify, refresh the UI, and sync to Sheets."""
-		messagebox.showinfo("Complete", message)
+		"""Show success feedback, refresh the UI, and sync to Sheets."""
+		self.set_action_feedback(message, "success")
 		row = self.database.execute("SELECT * FROM items WHERE barcode = ?", (self.selected_barcode,)).fetchone()
 		if row:
 			self.show_item(row)
 		self.borrower_name.set("")
 		self.refresh_items()
 		self.sync_to_google_sheets(show_result=False)
+		if self.selected_barcode:
+			self.queue_web_service_checkout_sync(self.selected_barcode)
 
 	def clear_selection(self) -> None:
-		"""Reset the details panel to its no-item-selected state."""
+		"""Clear the active item and all inventory checkbox selections."""
+		self.cancel_selection_clear_timer()
 		self.selected_barcode = None
+		self.multi_scan_queue.clear()
 		self.item_name.set("Scan an item to begin")
 		self.item_status.set("Ready for scan")
 		self.item_category.set("")
 		self.borrower_name.set("")
-		self.checkout_button.configure(state="disabled")
-		self.checkin_button.configure(state="disabled")
+		if hasattr(self, "items_inner"):
+			self.refresh_items()
 		self.update_admin_controls()
 
 	def delete_selected_item(self) -> None:
@@ -3923,8 +5025,11 @@ class CheckInSystem:
 		barcode_entry.focus_set()
 
 	def close(self) -> None:
-		"""Stop the background sync worker and close the database before the window exits."""
+		"""Stop background workers and close the database before the window exits."""
+		self.cancel_selection_clear_timer()
 		self.google_executor.shutdown(wait=False, cancel_futures=True)
+		self.web_api_executor.shutdown(wait=False, cancel_futures=True)
+		self.notification_executor.shutdown(wait=False, cancel_futures=True)
 		self.database.close()
 		self.root.destroy()
 
@@ -3937,11 +5042,40 @@ if __name__ == "__main__":
 		"Point this at a separate copy (e.g. one made with Export Database) to test "
 		"safely on another computer without touching the live database.",
 	)
+	parser.add_argument(
+		"--api-url",
+		help="Optional hosted inventory API URL (for example https://your-service.onrender.com). ",
+		default=WEB_API_BASE_URL,
+	)
+	parser.add_argument(
+		"--api-email",
+		help="Email address used to log in to the hosted inventory API.",
+		default=WEB_API_EMAIL,
+	)
+	parser.add_argument(
+		"--api-password",
+		help="Password used to log in to the hosted inventory API.",
+		default=WEB_API_PASSWORD,
+	)
+	parser.add_argument(
+		"--api-inventory-id",
+		type=int,
+		help="Inventory ID to target when a user has more than one hosted inventory. Defaults to the first inventory.",
+		default=(int(WEB_API_INVENTORY_ID) if WEB_API_INVENTORY_ID else None),
+	)
 	cli_args = parser.parse_args()
 	if cli_args.database:
 		DATABASE_FILE = str(Path(cli_args.database).expanduser().resolve())
 		Path(DATABASE_FILE).parent.mkdir(parents=True, exist_ok=True)
 		BACKUP_DIRECTORY = Path(DATABASE_FILE).parent / "database_backups"
+	if cli_args.api_url:
+		WEB_API_BASE_URL = cli_args.api_url.strip()
+	if cli_args.api_email:
+		WEB_API_EMAIL = cli_args.api_email.strip()
+	if cli_args.api_password:
+		WEB_API_PASSWORD = cli_args.api_password
+	if cli_args.api_inventory_id is not None:
+		WEB_API_INVENTORY_ID = str(cli_args.api_inventory_id)
 
 	application = tk.Tk()
 	CheckInSystem(application)
